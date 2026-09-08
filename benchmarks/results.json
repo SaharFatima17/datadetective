@@ -1,0 +1,75 @@
+{
+  "total_scenarios": 6,
+  "passed": 6,
+  "accuracy": 1.0,
+  "results": [
+    {
+      "scenario": "regional_decline",
+      "criterion": "true cause ranked first",
+      "true_cause": "Revenue decline is concentrated in region South",
+      "top_finding": "region = 'South' contributed 94.27% of the total revenue decline (from 50084.0 to 38281.31 per period, -23.57%).",
+      "found_at_rank_1": true,
+      "found_anywhere": true,
+      "findings_count": 3,
+      "all_verified": true,
+      "passed": true,
+      "latency_seconds": 2.0
+    },
+    {
+      "scenario": "stock_shortage",
+      "criterion": "true cause ranked first",
+      "true_cause": "in_stock_rate correlates with revenue; Beta availability fell",
+      "top_finding": "product = 'Beta' contributed 101.43% of the total revenue decline (from 38331.19 to 26723.08 per period, -30.28%).",
+      "found_at_rank_1": true,
+      "found_anywhere": true,
+      "findings_count": 3,
+      "all_verified": true,
+      "passed": true,
+      "latency_seconds": 1.7
+    },
+    {
+      "scenario": "price_increase",
+      "criterion": "true cause ranked first",
+      "true_cause": "price is inversely related to units, reducing revenue",
+      "top_finding": "price and revenue are correlated (r=-0.907, n=630).",
+      "found_at_rank_1": true,
+      "found_anywhere": true,
+      "findings_count": 2,
+      "all_verified": true,
+      "passed": true,
+      "latency_seconds": 1.1
+    },
+    {
+      "scenario": "missing_evidence",
+      "criterion": "asks instead of asserting",
+      "asked_for_evidence": true,
+      "asserted_high_confidence_cause": false,
+      "passed": true,
+      "latency_seconds": 0.9
+    },
+    {
+      "scenario": "multi_source",
+      "criterion": "true cause ranked first",
+      "true_cause": "Widget revenue in the North region fell because a warehouse cooling failure cut Widget stock availability",
+      "top_finding": "region = 'North' contributed 94.62% of the total revenue decline (from 60702.36 to 40161.12 per period, -33.84%).",
+      "found_at_rank_1": true,
+      "found_anywhere": true,
+      "findings_count": 4,
+      "all_verified": true,
+      "passed": true,
+      "latency_seconds": 1.2
+    },
+    {
+      "scenario": "changed_driver",
+      "criterion": "true cause ranked first",
+      "true_cause": "The current decline is driven by product Y, not by region A as before",
+      "top_finding": "product = 'Y' contributed 116.88% of the total revenue decline (from 51146.21 to 18032.83 per period, -64.74%).",
+      "found_at_rank_1": true,
+      "found_anywhere": true,
+      "findings_count": 2,
+      "all_verified": true,
+      "passed": true,
+      "latency_seconds": 0.8
+    }
+  ]
+}

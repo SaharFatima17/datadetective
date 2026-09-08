@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DataDetective</title>
+<style>
+:root{
+  --paper:#EDF0F3; --card:#FFFFFF; --ink:#1B2430; --muted:#5D6B7A;
+  --rule:#C9D2DA; --signal:#1F4FD8; --verified:#0E7C66; --warn:#B26A00; --alert:#B3261E;
+  --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+body{
+  margin:0; background:var(--paper); color:var(--ink);
+  font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  font-variant-numeric:tabular-nums;
+}
+header{
+  display:flex; align-items:baseline; gap:14px;
+  padding:14px 22px; background:var(--card); border-bottom:1px solid var(--rule);
+}
+header h1{font-size:17px; margin:0; letter-spacing:-.01em}
+header .sub{color:var(--muted); font-size:13px}
+header .spacer{flex:1}
+header .badge{font:12px var(--mono); color:var(--muted)}
+
+.wrap{display:grid; grid-template-columns:280px 1fr; gap:1px; background:var(--rule);
+  min-height:calc(100vh - 52px)}
+.rail,.main{background:var(--paper); padding:18px 20px}
+.rail{border-right:1px solid var(--rule)}
+
+h2{font-size:13px; font-weight:600; color:var(--muted); margin:0 0 10px}
+.card{background:var(--card); border:1px solid var(--rule); padding:14px 16px; margin-bottom:14px}
+
+button{
+  font:inherit; font-size:14px; padding:7px 13px; border:1px solid var(--ink);
+  background:var(--ink); color:#fff; cursor:pointer;
+}
+button:hover{opacity:.88}
+button.ghost{background:transparent; color:var(--ink)}
+button:disabled{opacity:.4; cursor:not-allowed}
+button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--signal); outline-offset:1px}
+input,select,textarea{font:inherit; padding:7px 9px; border:1px solid var(--rule); background:var(--card); width:100%}
+
+.ds{padding:9px 10px; border:1px solid transparent; cursor:pointer; margin-bottom:2px}
+.ds:hover{border-color:var(--rule); background:var(--card)}
+.ds.on{background:var(--card); border-color:var(--ink)}
+.ds .n{font-weight:600; font-size:14px}
+.ds .m{font:12px var(--mono); color:var(--muted)}
+
+nav.tabs{display:flex; gap:0; border-bottom:1px solid var(--rule); margin-bottom:16px}
+nav.tabs button{
+  background:none; color:var(--muted); border:none; border-bottom:2px solid transparent;
+  padding:8px 14px; font-size:14px;
+}
+nav.tabs button.on{color:var(--ink); border-bottom-color:var(--ink); font-weight:600}
+
+table{width:100%; border-collapse:collapse; font-size:13.5px}
+th{text-align:left; font-weight:600; color:var(--muted); padding:6px 8px; border-bottom:1px solid var(--rule)}
+td{padding:6px 8px; border-bottom:1px solid #E6EAEE}
+td.num{text-align:right; font-family:var(--mono)}
+
+.score{font:600 44px/1 var(--mono); letter-spacing:-.02em}
+.issue{display:flex; gap:10px; padding:8px 0; border-bottom:1px solid #E6EAEE; font-size:13.5px}
+.sev{font:11px var(--mono); padding:1px 6px; height:19px; border:1px solid currentColor}
+.sev.high{color:var(--alert)} .sev.medium{color:var(--warn)} .sev.low{color:var(--muted)}
+
+.finding{border-left:3px solid var(--verified); padding:2px 0 2px 13px; margin-bottom:16px}
+.finding.unverified{border-left-color:var(--warn)}
+.finding .st{font-weight:600}
+.finding .ev{color:var(--muted); font-size:13.5px; margin-top:3px}
+.finding .cav{color:var(--warn); font-size:13px; margin-top:3px}
+
+.rec{border:1px solid var(--rule); padding:12px 14px; margin-bottom:10px; background:var(--card)}
+.rec .rank{font:12px var(--mono); color:var(--muted)}
+.rec .act{font-weight:600; margin:3px 0 5px}
+details{margin-top:6px} summary{cursor:pointer; font-size:13px; color:var(--muted)}
+pre{background:#F4F6F8; border:1px solid var(--rule); padding:11px; overflow:auto;
+  font:12.5px/1.5 var(--mono); margin:6px 0 0}
+.ask{border:1px solid var(--warn); background:#FDF6EC; padding:13px 15px; margin-bottom:14px}
+.muted{color:var(--muted)} .small{font-size:13px}
+.row{display:flex; gap:9px; align-items:center}
+.row > input{flex:1}
+.hint{font-size:12.5px; color:var(--muted); margin-top:5px}
+.empty{color:var(--muted); padding:26px 0; text-align:center}
+
+/* auth gate */
+#gate{display:none; place-items:center; min-height:calc(100vh - 52px); padding:30px}
+#gate .box{background:var(--card); border:1px solid var(--rule); padding:26px 28px; width:360px}
+#gate h2{font-size:15px; color:var(--ink); margin:0 0 4px}
+#gate .lead{color:var(--muted); font-size:13.5px; margin:0 0 16px}
+#gate label{display:block; font-size:12.5px; color:var(--muted); margin:10px 0 3px}
+#gate button{width:100%; margin-top:16px}
+#gate .alt{margin-top:12px; text-align:center; font-size:13px}
+#gate .alt a{color:var(--signal); cursor:pointer; text-decoration:underline}
+#gate .err{color:var(--alert); font-size:13px; margin-top:10px; min-height:18px}
+header .who{font-size:13px; color:var(--muted)}
+header .who button{background:none; color:var(--signal); border:none; padding:0 0 0 10px;
+  font-size:13px; text-decoration:underline}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>DataDetective</h1>
+  <span class="sub">Autonomous data investigation</span>
+  <span class="spacer"></span>
+  <span class="who" id="who"></span>
+  <span class="badge" id="env">&nbsp;</span>
+</header>
+
+<div id="gate">
+  <div class="box">
+    <h2 id="gt">Sign in</h2>
+    <p class="lead" id="gl">Your datasets and investigations are private to your account.</p>
+    <div id="nameRow" style="display:none">
+      <label for="gname">Full name</label>
+      <input id="gname" autocomplete="name">
+    </div>
+    <label for="gemail">Email</label>
+    <input id="gemail" type="email" autocomplete="username">
+    <label for="gpass">Password</label>
+    <input id="gpass" type="password" autocomplete="current-password">
+    <button id="gbtn">Sign in</button>
+    <div class="err" id="gerr"></div>
+    <div class="alt">
+      <span id="galt">No account yet? <a id="gswitch">Create one</a></span>
+    </div>
+  </div>
+</div>
+
+<div class="wrap" id="workspace">
+  <aside class="rail">
+    <h2>Add data</h2>
+    <div class="card">
+      <input type="file" id="file" accept=".csv,.xlsx,.xls,.json,.parquet,.pdf,.docx,.pptx,.txt,.html">
+      <div class="hint">Tables become datasets. Documents are indexed as context.</div>
+      <button id="up" style="width:100%; margin-top:9px">Upload</button>
+    </div>
+
+    <h2>Datasets</h2>
+    <div id="dslist"><div class="empty small">Nothing uploaded yet.</div></div>
+  </aside>
+
+  <main class="main">
+    <nav class="tabs">
+      <button data-t="health" class="on">Health</button>
+      <button data-t="clean">Clean</button>
+      <button data-t="ask">Ask</button>
+      <button data-t="report">Report</button>
+    </nav>
+    <div id="view"><div class="empty">Upload a dataset to begin.</div></div>
+  </main>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+let token = null;   // kept in memory only - not written to browser storage
+
+const api = async (path, opts={}) => {
+  const headers = Object.assign({}, opts.headers || {});
+  if(token) headers['Authorization'] = 'Bearer ' + token;
+  const r = await fetch(path, Object.assign({}, opts, {headers}));
+  if(r.status === 401){ token = null; showGate(); throw new Error('Please sign in again.'); }
+  const body = await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(body.detail || r.statusText);
+  return body;
+};
+const esc = s => String(s??'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+let state = { dataset:null, tab:'health', investigation:null, plan:null };
+
+fetch('/api').then(r=>r.json()).then(d=>{
+  $('#env').textContent = `llm: ${d.llm_provider}`;
+});
+
+// ---------- auth ----------
+let mode = 'login';
+
+function showGate(){
+  $('#gate').style.display = 'grid';
+  $('#workspace').style.display = 'none';
+  $('#who').textContent = '';
+}
+function showWorkspace(user){
+  $('#gate').style.display = 'none';
+  $('#workspace').style.display = 'grid';
+  $('#who').innerHTML = `${esc(user.email)} · ${esc(user.role)}<button id="out">Sign out</button>`;
+  $('#out').onclick = () => { token = null; state = {dataset:null, tab:'health',
+    investigation:null, plan:null}; showGate(); };
+}
+
+$('#gswitch').onclick = () => {
+  mode = mode === 'login' ? 'register' : 'login';
+  const reg = mode === 'register';
+  $('#gt').textContent = reg ? 'Create an account' : 'Sign in';
+  $('#gl').textContent = reg
+    ? 'The first account created becomes the administrator.'
+    : 'Your datasets and investigations are private to your account.';
+  $('#nameRow').style.display = reg ? 'block' : 'none';
+  $('#gbtn').textContent = reg ? 'Create account' : 'Sign in';
+  $('#galt').innerHTML = reg
+    ? 'Already have an account? <a id="gswitch">Sign in</a>'
+    : 'No account yet? <a id="gswitch">Create one</a>';
+  $('#gerr').textContent = '';
+  $('#gswitch').onclick = arguments.callee;
+};
+
+$('#gbtn').onclick = async () => {
+  const email = $('#gemail').value.trim(), password = $('#gpass').value;
+  if(!email || !password){ $('#gerr').textContent = 'Enter an email and password.'; return; }
+  $('#gbtn').disabled = true;
+  $('#gerr').textContent = '';
+  try{
+    if(mode === 'register'){
+      const r = await fetch('/api/auth/register', {method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({email, password, full_name: $('#gname').value.trim() || null})});
+      const b = await r.json().catch(()=>({}));
+      if(!r.ok) throw new Error(typeof b.detail === 'string' ? b.detail
+        : 'Password must be at least 8 characters.');
+    }
+    const r = await fetch('/api/auth/login', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({email, password})});
+    const b = await r.json().catch(()=>({}));
+    if(!r.ok) throw new Error(b.detail || 'Sign in failed.');
+    token = b.access_token;
+    $('#gpass').value = '';
+    showWorkspace(b.user);
+    await loadDatasets();
+    render();
+  }catch(e){ $('#gerr').textContent = e.message; }
+  finally{ $('#gbtn').disabled = false; }
+};
+
+$('#gpass').addEventListener('keydown', e => { if(e.key === 'Enter') $('#gbtn').click(); });
+
+// ---------- datasets ----------
+async function loadDatasets(){
+  const d = await api('/api/datasets');
+  const el = $('#dslist');
+  if(!d.count){ el.innerHTML = '<div class="empty small">Nothing uploaded yet.</div>'; return; }
+  el.innerHTML = d.datasets.map(x => `
+    <div class="ds ${state.dataset===x.id?'on':''}" data-id="${x.id}">
+      <div class="n">${esc(x.name)}</div>
+      <div class="m">v${x.versions} · ${x.id.slice(0,8)}</div>
+    </div>`).join('');
+  el.querySelectorAll('.ds').forEach(n => n.onclick = () => {
+    state.dataset = n.dataset.id; state.investigation = null;
+    loadDatasets(); render();
+  });
+}
+
+$('#up').onclick = async () => {
+  const f = $('#file').files[0];
+  if(!f) return alert('Choose a file first.');
+  const fd = new FormData(); fd.append('file', f);
+  $('#up').disabled = true; $('#up').textContent = 'Uploading…';
+  try{
+    const r = await api('/api/sources/upload', {method:'POST', body:fd});
+    if(r.kind === 'dataset'){ state.dataset = r.dataset_id; state.tab = 'health'; }
+    else alert(`Indexed "${r.name}" as context (${r.chunks} chunks).`);
+    await loadDatasets(); render();
+  }catch(e){ alert('Upload failed: ' + e.message); }
+  finally{ $('#up').disabled = false; $('#up').textContent = 'Upload'; }
+};
+
+document.querySelectorAll('nav.tabs button').forEach(b => b.onclick = () => {
+  state.tab = b.dataset.t;
+  document.querySelectorAll('nav.tabs button').forEach(x => x.classList.toggle('on', x===b));
+  render();
+});
+
+// ---------- views ----------
+async function render(){
+  const v = $('#view');
+  if(!state.dataset){ v.innerHTML = '<div class="empty">Upload a dataset to begin.</div>'; return; }
+  v.innerHTML = '<div class="empty">Loading…</div>';
+  try{
+    if(state.tab==='health') await viewHealth(v);
+    if(state.tab==='clean') await viewClean(v);
+    if(state.tab==='ask') await viewAsk(v);
+    if(state.tab==='report') await viewReport(v);
+  }catch(e){ v.innerHTML = `<div class="card">Could not load this view: ${esc(e.message)}</div>`; }
+}
+
+async function viewHealth(v){
+  const h = await api(`/api/datasets/${state.dataset}/health`);
+  const p = await api(`/api/datasets/${state.dataset}/profile`);
+  const colour = h.health_score>=80 ? 'var(--verified)' : h.health_score>=50 ? 'var(--warn)' : 'var(--alert)';
+  v.innerHTML = `
+    <div class="card">
+      <div class="row" style="gap:30px; align-items:flex-end">
+        <div><div class="score" style="color:${colour}">${h.health_score}</div>
+          <div class="muted small">health score</div></div>
+        <div><div class="score">${h.row_count.toLocaleString()}</div>
+          <div class="muted small">rows</div></div>
+        <div><div class="score">${h.column_count}</div>
+          <div class="muted small">columns</div></div>
+        <div class="small muted">
+          ${h.issue_counts.high} high · ${h.issue_counts.medium} medium · ${h.issue_counts.low} low
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Quality issues</h2>
+      ${h.issues.length ? h.issues.map(i=>`
+        <div class="issue"><span class="sev ${i.severity}">${i.severity}</span>
+          <span><strong>${esc(i.issue.replace(/_/g,' '))}</strong> — ${esc(i.detail)}
+          <span class="muted">(${i.affected_rows} rows)</span></span></div>`).join('')
+        : '<div class="muted small">No quality issues detected.</div>'}
+    </div>
+    <div class="card">
+      <h2>Columns</h2>
+      <table><thead><tr><th>Column</th><th>Type</th><th>Meaning</th>
+        <th class="num">Missing</th><th class="num">Unique</th></tr></thead><tbody>
+        ${p.columns.map(c=>`<tr><td>${esc(c.name)}</td><td class="muted">${c.inferred_type}</td>
+          <td class="muted">${c.semantic_label||'—'}</td>
+          <td class="num">${c.null_percentage}%</td>
+          <td class="num">${c.unique_count.toLocaleString()}</td></tr>`).join('')}
+      </tbody></table>
+    </div>`;
+}
+
+async function viewClean(v){
+  const plan = await api(`/api/datasets/${state.dataset}/cleaning-plan`);
+  if(!plan.operations.length){
+    v.innerHTML = '<div class="card">No cleaning operations are needed for this version.</div>'; return;
+  }
+  v.innerHTML = `
+    <div class="card">
+      <h2>Proposed operations</h2>
+      <p class="small muted">Safe operations run automatically. Tick the ones that change or remove
+      real values. Applying always creates a new version — the current one is never overwritten.</p>
+      <table><thead><tr><th style="width:34px"></th><th>Operation</th><th>Column</th>
+        <th>Reason</th><th class="num">Rows</th></tr></thead><tbody>
+        ${plan.operations.map(o=>`<tr>
+          <td>${o.safe ? '<span class="muted small">auto</span>'
+              : `<input type="checkbox" style="width:auto" value="${esc(o.op_id)}">`}</td>
+          <td>${esc(o.operation.replace(/_/g,' '))}</td>
+          <td class="muted">${esc(o.column||'—')}</td>
+          <td class="small">${esc(o.reason)}</td>
+          <td class="num">${o.estimated_affected_rows}</td></tr>`).join('')}
+      </tbody></table>
+      <button id="apply" style="margin-top:12px">Apply and create new version</button>
+    </div>
+    <div id="cres"></div>`;
+
+  $('#apply').onclick = async () => {
+    const ids = [...v.querySelectorAll('input[type=checkbox]:checked')].map(c=>c.value);
+    $('#apply').disabled = true; $('#apply').textContent = 'Applying…';
+    try{
+      const r = await api(`/api/datasets/${state.dataset}/cleaning-plan/apply`,
+        {method:'POST', headers:{'Content-Type':'application/json'},
+         body:JSON.stringify({approved_op_ids:ids})});
+      $('#cres').innerHTML = `<div class="card">
+        <h2>Version ${r.version_number} created</h2>
+        <table><tr><th></th><th class="num">Rows</th><th class="num">Health</th></tr>
+        <tr><td>before</td><td class="num">${r.before.rows}</td><td class="num">${r.before.health_score??'—'}</td></tr>
+        <tr><td>after</td><td class="num">${r.after.rows}</td><td class="num">${r.after.health_score}</td></tr></table>
+        <details><summary>${r.executed.length} executed, ${r.skipped.length} skipped</summary>
+        <pre>${esc(JSON.stringify(r.executed.map(o=>
+          ({op:o.operation, column:o.column, estimated:o.estimated_affected_rows,
+            actual:o.actual_affected_rows})), null, 2))}</pre></details></div>`;
+      await loadDatasets();
+    }catch(e){ alert('Apply failed: ' + e.message); }
+    finally{ $('#apply').disabled=false; $('#apply').textContent='Apply and create new version'; }
+  };
+}
+
+async function viewAsk(v){
+  v.innerHTML = `
+    <div class="card">
+      <h2>Ask a question about this data</h2>
+      <div class="row">
+        <input id="q" placeholder="Why did revenue decline?" value="Why did revenue decline?">
+        <button id="go">Investigate</button>
+      </div>
+      <div class="hint">The system profiles the data, forms hypotheses, tests them with
+      SQL and statistics, verifies every number, then reports. It asks you for anything it needs.</div>
+    </div>
+    <div id="out"></div>`;
+
+  $('#go').onclick = async () => {
+    const q = $('#q').value.trim(); if(!q) return;
+    $('#go').disabled = true; $('#go').textContent = 'Working…';
+    $('#out').innerHTML = '<div class="empty">Running the investigation. This can take a minute.</div>';
+    try{
+      const r = await api('/api/investigations', {method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({dataset_id:state.dataset, question:q})});
+      state.investigation = r.investigation_id;
+      renderInvestigation(r, $('#out'));
+    }catch(e){ $('#out').innerHTML = `<div class="card">Investigation failed: ${esc(e.message)}</div>`; }
+    finally{ $('#go').disabled=false; $('#go').textContent='Investigate'; }
+  };
+}
+
+function renderInvestigation(r, el){
+  const rep = r.report;
+  let html = '';
+
+  (r.open_requests||[]).forEach(q => {
+    html += `<div class="ask"><strong>The system needs more information</strong>
+      <p style="margin:7px 0">${esc(q.question)}</p>
+      <div class="row"><input class="ansbox" data-id="${q.id}" placeholder="Your answer">
+      <button class="ansbtn" data-id="${q.id}">Send and continue</button></div>
+      <div class="hint">${esc(q.reason||'')}</div></div>`;
+  });
+
+  if(rep){
+    html += `<div class="card"><h2>Summary</h2><p>${esc(rep.executive_summary)}</p></div>`;
+
+    html += `<div class="card"><h2>Findings</h2>` + (rep.findings?.length
+      ? rep.findings.map(f=>`<div class="finding ${f.verification_status==='verified'?'':'unverified'}">
+          <div class="st">${esc(f.statement)}</div>
+          <div class="ev">${esc(f.evidence_summary)}</div>
+          ${f.caveats?`<div class="cav">${esc(f.caveats)}</div>`:''}
+          <div class="muted small" style="margin-top:3px">
+            confidence ${esc(f.confidence)} · ${esc(f.verification_status.replace(/_/g,' '))}
+            ${f.tool_run_id?` · run ${f.tool_run_id.slice(0,8)}`:''}</div></div>`).join('')
+      : '<div class="muted small">No finding met the verification bar.</div>') + '</div>';
+
+    if(rep.unresolved_hypotheses?.length){
+      html += `<div class="card"><h2>Unresolved</h2>
+        <p class="small muted">Generated but not testable with the data available. Listed as
+        unresolved rather than treated as answered.</p>
+        <ul class="small">${rep.unresolved_hypotheses.map(h=>`<li>${esc(h)}</li>`).join('')}</ul></div>`;
+    }
+
+    (rep.forecasts||[]).forEach(f=>{
+      html += `<div class="card"><h2>Forecast — ${esc(f.target_metric)}</h2>`;
+      if(f.reliability !== 'ok' || !f.predictions?.length){
+        html += `<p class="small"><strong>Withheld.</strong> ${esc(f.withheld_reason||'Not reliable enough to show.')}</p>`;
+      }else{
+        html += `<table><thead><tr><th>Period</th><th class="num">Projected</th>
+          <th class="num">Low</th><th class="num">High</th></tr></thead><tbody>
+          ${f.predictions.map(p=>`<tr><td>${esc(p.period)}</td><td class="num">${p.point}</td>
+            <td class="num muted">${p.lower}</td><td class="num muted">${p.upper}</td></tr>`).join('')}
+          </tbody></table>
+          <div class="hint">Model ${esc(f.model)} · backtest MAPE ${f.backtest?.mape ?? '—'}%
+          · assumes current patterns continue</div>`;
+      }
+      html += '</div>';
+    });
+
+    if(rep.recommendations?.length){
+      html += `<div class="card"><h2>Recommended actions</h2>` + rep.recommendations.map(x=>`
+        <div class="rec"><div class="rank">rank ${x.rank} · ${esc(x.urgency||'')} urgency
+          · ${esc(x.confidence||'')} confidence</div>
+          <div class="act">${esc(x.action)}</div>
+          <div class="small">${esc(x.rationale||'')}</div>
+          <div class="small muted" style="margin-top:5px">Estimated impact
+            ${x.expected_impact?.low}–${x.expected_impact?.high} ${esc(x.expected_impact?.unit||'')}</div>
+          <details><summary>How this estimate was calculated</summary>
+            <pre>${esc(x.impact_method||'')}</pre></details></div>`).join('') + '</div>';
+    }
+
+    if(rep.critique?.concerns?.length){
+      html += `<div class="card"><h2>Reviewer concerns</h2>
+        <ul class="small">${rep.critique.concerns.map(c=>`<li>${esc(c)}</li>`).join('')}</ul></div>`;
+    }
+
+    html += `<div class="card"><h2>Limitations</h2>
+      <ul class="small muted">${(rep.limitations||[]).map(l=>`<li>${esc(l)}</li>`).join('')}</ul></div>`;
+  }
+
+  el.innerHTML = html || '<div class="empty">No output produced.</div>';
+
+  el.querySelectorAll('.ansbtn').forEach(b => b.onclick = async () => {
+    const box = el.querySelector(`.ansbox[data-id="${b.dataset.id}"]`);
+    if(!box.value.trim()) return;
+    b.disabled = true; b.textContent = 'Continuing…';
+    try{
+      const r = await api(`/api/investigations/${state.investigation}/resume`, {method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({request_id:b.dataset.id, response:box.value})});
+      renderInvestigation(r, el);
+    }catch(e){ alert('Could not continue: ' + e.message); b.disabled=false; }
+  });
+}
+
+async function viewReport(v){
+  const list = await api('/api/investigations');
+  const mine = list.investigations.filter(i => true);
+  if(!mine.length){ v.innerHTML = '<div class="empty">No investigations yet. Use the Ask tab.</div>'; return; }
+  v.innerHTML = `<div class="card"><h2>Investigations</h2>
+    <table><thead><tr><th>Question</th><th>Status</th><th>Metric</th><th></th></tr></thead><tbody>
+    ${mine.map(i=>`<tr><td>${esc(i.question)}</td><td class="muted">${esc(i.status)}</td>
+      <td class="muted">${esc(i.target_metric||'—')}</td>
+      <td><button class="ghost open" data-id="${i.id}">Open</button></td></tr>`).join('')}
+    </tbody></table></div><div id="out"></div>`;
+  v.querySelectorAll('.open').forEach(b => b.onclick = async () => {
+    state.investigation = b.dataset.id;
+    const r = await api(`/api/investigations/${b.dataset.id}`);
+    renderInvestigation(r, $('#out'));
+  });
+}
+
+showGate();
+</script>
+</body>
+</html>

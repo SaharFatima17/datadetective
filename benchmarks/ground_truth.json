@@ -1,0 +1,256 @@
+[
+  {
+    "scenario": "regional_decline",
+    "true_cause": "Revenue decline is concentrated in region South",
+    "true_driver_column": "region",
+    "true_driver_value": "South",
+    "target_metric": "revenue",
+    "best_known_action": "Investigate and restore performance in the South region",
+    "forecast_holdout": {
+      "cutoff": "2024-10-01",
+      "held_out_periods": [
+        {
+          "period": "2024-10-01",
+          "actual": 164524.87
+        },
+        {
+          "period": "2024-11-01",
+          "actual": 182020.45
+        },
+        {
+          "period": "2024-12-01",
+          "actual": 166432.5
+        }
+      ]
+    },
+    "true_magnitude": 11802.7,
+    "file": "regional_decline.csv",
+    "rows": 252
+  },
+  {
+    "scenario": "stock_shortage",
+    "true_cause": "in_stock_rate correlates with revenue; Beta availability fell",
+    "true_driver_column": "in_stock_rate",
+    "true_driver_value": "Beta",
+    "magnitude_group_column": "product",
+    "target_metric": "revenue",
+    "best_known_action": "Restock product Beta to restore availability",
+    "forecast_holdout": {
+      "cutoff": "2024-10-01",
+      "held_out_periods": [
+        {
+          "period": "2024-10-01",
+          "actual": 93832.3
+        },
+        {
+          "period": "2024-11-01",
+          "actual": 91116.97
+        },
+        {
+          "period": "2024-12-01",
+          "actual": 95700.83
+        }
+      ]
+    },
+    "true_magnitude": 11608.12,
+    "file": "stock_shortage.csv",
+    "rows": 63
+  },
+  {
+    "scenario": "price_increase",
+    "true_cause": "price is inversely related to units, reducing revenue",
+    "true_driver_column": "price",
+    "true_driver_value": null,
+    "target_metric": "revenue",
+    "best_known_action": "Review the price increase introduced in July 2024",
+    "forecast_holdout": {
+      "cutoff": "2024-10-01",
+      "held_out_periods": [
+        {
+          "period": "2024-10-01",
+          "actual": 112230.0
+        },
+        {
+          "period": "2024-11-01",
+          "actual": 112665.0
+        },
+        {
+          "period": "2024-12-01",
+          "actual": 116290.0
+        }
+      ]
+    },
+    "file": "price_increase.csv",
+    "rows": 630
+  },
+  {
+    "scenario": "missing_evidence",
+    "true_cause": "Not determinable from this dataset - an external factor",
+    "true_driver_column": null,
+    "true_driver_value": null,
+    "target_metric": "revenue",
+    "expected_behaviour": "should raise a missing-evidence request, not assert a cause",
+    "best_known_action": "Request additional operational data before concluding",
+    "forecast_holdout": {
+      "cutoff": "2024-10-01",
+      "held_out_periods": [
+        {
+          "period": "2024-10-01",
+          "actual": 39757.19
+        },
+        {
+          "period": "2024-11-01",
+          "actual": 38398.55
+        },
+        {
+          "period": "2024-12-01",
+          "actual": 38564.0
+        }
+      ]
+    },
+    "file": "missing_evidence.csv",
+    "rows": 420
+  },
+  {
+    "scenario": "multi_source",
+    "true_cause": "Widget revenue in the North region fell because a warehouse cooling failure cut Widget stock availability",
+    "true_driver_column": "region",
+    "true_driver_value": "North",
+    "target_metric": "revenue",
+    "requires_document": true,
+    "document_evidence_terms": [
+      "warehouse",
+      "cooling",
+      "stock",
+      "aisle"
+    ],
+    "best_known_action": "Restore Widget stock availability at the North distribution centre",
+    "forecast_holdout": {
+      "cutoff": "2024-10-01",
+      "held_out_periods": [
+        {
+          "period": "2024-10-01",
+          "actual": 159092.31
+        },
+        {
+          "period": "2024-11-01",
+          "actual": 158521.36
+        },
+        {
+          "period": "2024-12-01",
+          "actual": 158704.12
+        }
+      ]
+    },
+    "true_magnitude": 20541.24,
+    "file": "multi_source.csv",
+    "rows": 126,
+    "document": {
+      "title": "Warehouse incident report - North distribution centre",
+      "document_type": "business_doc",
+      "text": "Warehouse incident report - North distribution centre\n\nOn 2 April 2024 a cooling system failure at the North distribution centre forced the closure of aisle 4, where all Widget stock is held. Widget inventory available for dispatch in the North region fell to roughly one quarter of normal levels and has not yet been restored.\n\nImpact: Widget orders originating in the North region could not be fulfilled from April 2024 onward. Other products and other regions were unaffected because their stock is held in separate aisles.\n\nRemediation: the cooling unit replacement is scheduled but not yet complete. Until then, Widget availability in the North region remains constrained.",
+      "file": "multi_source_context.txt"
+    }
+  },
+  {
+    "scenario": "changed_driver",
+    "true_cause": "The current decline is driven by product Y, not by region A as before",
+    "true_driver_column": "product",
+    "true_driver_value": "Y",
+    "previous_driver_column": "region",
+    "previous_driver_value": "A",
+    "target_metric": "revenue",
+    "tests_driver_change": true,
+    "earlier_scope": {
+      "start": "2023-01-01",
+      "end": "2023-12-31"
+    },
+    "scope": {
+      "start": "2024-01-01",
+      "end": "2025-12-31"
+    },
+    "best_known_action": "Address the product Y decline; the earlier region A problem has resolved",
+    "forecast_holdout": {
+      "cutoff": "2025-10-01",
+      "held_out_periods": [
+        {
+          "period": "2025-10-01",
+          "actual": 77592.87
+        },
+        {
+          "period": "2025-11-01",
+          "actual": 76851.7
+        },
+        {
+          "period": "2025-12-01",
+          "actual": 76091.55
+        }
+      ]
+    },
+    "true_magnitude": 23997.22,
+    "file": "changed_driver.csv",
+    "rows": 198
+  },
+  {
+    "scenario": "dirty_data",
+    "true_cause": "Not a root-cause scenario - this one scores profiling and cleaning",
+    "true_driver_column": null,
+    "true_driver_value": null,
+    "target_metric": "revenue",
+    "quality_benchmark": true,
+    "expected_issues": [
+      [
+        "revenue",
+        "missing_values"
+      ],
+      [
+        "revenue",
+        "invalid_range"
+      ],
+      [
+        "revenue",
+        "outliers"
+      ],
+      [
+        "region",
+        "inconsistent_categories"
+      ],
+      [
+        "region",
+        "similar_categories"
+      ],
+      [
+        "order_date",
+        "date_problems"
+      ],
+      [
+        "order_id",
+        "duplicate_keys"
+      ],
+      [
+        "__dataset__",
+        "duplicate_rows"
+      ]
+    ],
+    "not_auto_repairable": [
+      [
+        "region",
+        "similar_categories"
+      ],
+      [
+        "order_id",
+        "duplicate_keys"
+      ],
+      [
+        "revenue",
+        "outliers"
+      ]
+    ],
+    "clean_row_count": 240,
+    "injected_duplicate_rows": 10,
+    "best_known_action": "Clean the dataset before drawing conclusions from it",
+    "file": "dirty_data.csv",
+    "rows": 250,
+    "reference_file": "dirty_data_reference.csv"
+  }
+]

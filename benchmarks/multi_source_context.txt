@@ -1,0 +1,7 @@
+Warehouse incident report - North distribution centre
+
+On 2 April 2024 a cooling system failure at the North distribution centre forced the closure of aisle 4, where all Widget stock is held. Widget inventory available for dispatch in the North region fell to roughly one quarter of normal levels and has not yet been restored.
+
+Impact: Widget orders originating in the North region could not be fulfilled from April 2024 onward. Other products and other regions were unaffected because their stock is held in separate aisles.
+
+Remediation: the cooling unit replacement is scheduled but not yet complete. Until then, Widget availability in the North region remains constrained.
