@@ -116,6 +116,8 @@ def run_one(db, system: str, dataset_id, question: str, truth: dict) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--systems", default="baseline_a,baseline_b,baseline_c,proposed")
+    parser.add_argument("--scenarios", nargs="*", default=None,
+                        help="only these scenarios — a cheap trial before a full run")
     parser.add_argument("--ablations", action="store_true")
     parser.add_argument("--repeats", type=int, default=1)
     args = parser.parse_args()
@@ -140,10 +142,13 @@ def main() -> None:
     db = SessionLocal()
     per_system: dict[str, list[dict]] = {s: [] for s in systems}
     detail = []
+    failures: list[str] = []
 
     try:
         for truth in truths:
             name = truth["scenario"]
+            if args.scenarios and name not in args.scenarios:
+                continue
             if truth.get("quality_benchmark"):
                 # profiling/cleaning benchmark - scored by run_quality_evaluation.py
                 continue
@@ -161,9 +166,27 @@ def main() -> None:
                         db.rollback()
                         run = {"system": system, "answer": "", "findings": [],
                                "error": str(exc)}
+                        # A failed run still scores, as zero. Surfacing it here
+                        # matters: a table of zeros caused by an expired key
+                        # looks exactly like a table of zeros caused by a weak
+                        # baseline, and they mean opposite things.
+                        failures.append(f"{name}/{system}: {exc}")
+                        print(f"    ! {system}: {str(exc)[:90]}")
                     scored = metrics.score_run(truth, run)
                     scored["scenario"] = name
                     scored["system"] = system
+
+                    # A baseline that swallows its own provider error returns a
+                    # plausible-looking empty answer, and scores zero. That is
+                    # indistinguishable in the table from a baseline that simply
+                    # performed badly, so the two are separated here.
+                    scored["stop_reason"] = run.get("stop_reason")
+                    scored["steps"] = run.get("steps") or []
+
+                    lead = (scored.get("lead_answer") or "")
+                    if run.get("error") or lead.startswith("[error"):
+                        reason = run.get("error") or lead[:120]
+                        failures.append(f"{name}/{system}: {reason}")
                     scores.append(scored)
                     detail.append(scored)
 
@@ -174,13 +197,45 @@ def main() -> None:
     finally:
         db.close()
 
+    from app.llm.client import llm
+
     rows = [metrics.aggregate(s, per_system[s]) for s in systems if per_system[s]]
+
+    if failures:
+        print("\n" + "!" * 72)
+        print(f"{len(failures)} run(s) failed and were scored as zero:")
+        for line in failures[:10]:
+            print(f"  {line}")
+        print("These numbers are not comparable until the failures are fixed.")
+        print("!" * 72)
+
+    if not baselines.using_mock_llm():
+        print(f"\nLLM calls: {llm.calls}  (retried {llm.retries} times)")
+
+    # Why the agent baselines stopped. A run that exhausted its step budget and
+    # one that answered incorrectly both score zero, and they mean different
+    # things about the architecture being compared.
+    reasons: dict[str, dict[str, int]] = {}
+    for row in detail:
+        if row.get("stop_reason"):
+            reasons.setdefault(row["system"], {})
+            reasons[row["system"]][row["stop_reason"]] = (
+                reasons[row["system"]].get(row["stop_reason"], 0) + 1)
+    if reasons:
+        print("\nHow the agent baselines ended:")
+        for system, counts in reasons.items():
+            parts = ", ".join(f"{k.replace('_', ' ')} x{v}" for k, v in counts.items())
+            print(f"  {system:14s} {parts}")
+
     print("\n" + "=" * 72)
     print("ARCHITECTURE COMPARISON (proposal Sec.20)\n")
     print(metrics.format_table(rows))
 
     output = {
         "llm_provider_was_mock": baselines.using_mock_llm(),
+        "llm_calls": llm.calls,
+        "llm_retries": llm.retries,
+        "failed_runs": failures,
         "repeats": args.repeats,
         "scenarios": [t["scenario"] for t in truths if not t.get("quality_benchmark")],
         "summary": rows,

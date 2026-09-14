@@ -11,6 +11,8 @@ Sec.14's current-vs-historical comparison possible.
 
 from __future__ import annotations
 
+import logging
+
 import uuid
 
 from sqlalchemy.orm import Session
@@ -25,6 +27,9 @@ from app.models import (
     Recommendation,
     Report,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 def chunk_text(text: str, size: int = 900, overlap: int = 150) -> list[str]:
@@ -59,9 +64,11 @@ def index_document(
     document_type: str = "business_doc",
     source_id: uuid.UUID | None = None,
     metadata: dict | None = None,
+    owner_id: uuid.UUID | None = None,
 ) -> Document:
     doc = Document(
         source_id=source_id,
+        owner_id=owner_id,
         title=title,
         document_type=document_type,
         extracted_text=text[:1_000_000],
@@ -83,6 +90,9 @@ def index_document(
                     token_count=len(piece.split()),
                     chunk_metadata={
                         "vector": vector,
+                        # which model produced this vector; vectors from two
+                        # models cannot be compared with each other
+                        "embedding": embedder.signature,
                         "document_type": document_type,
                         **(metadata or {}),
                     },
@@ -97,20 +107,40 @@ def search(
     db: Session,
     query: str,
     top_k: int = 5,
-    document_type: str | None = None,
+    document_type: str | list[str] | None = None,
     min_score: float = 0.0,
+    owner_id=None,
 ) -> list[dict]:
-    """Semantic search with an optional structured filter (proposal Sec.14)."""
+    """Semantic search with an optional structured filter (proposal Sec.14).
+
+    `document_type` accepts a list, because "business context" is not one kind
+    of document: a KPI sheet, an incident note and a retrieved web page all
+    serve the same purpose during planning.
+    """
     q_vec = embedder.embed_one(query)
 
     stmt = db.query(DocumentChunk, Document).join(Document, DocumentChunk.document_id == Document.id)
-    if document_type:
+    if isinstance(document_type, (list, tuple, set)):
+        stmt = stmt.filter(Document.document_type.in_(list(document_type)))
+    elif document_type:
         stmt = stmt.filter(Document.document_type == document_type)
+    if owner_id is not None:
+        # Retrieval is scoped the same way the listings are: an investigation
+        # must not be informed by another account's documents or reports.
+        stmt = stmt.filter(Document.owner_id == owner_id)
 
     scored = []
+    skipped = 0
     for chunk, doc in stmt.all():
         vector = (chunk.chunk_metadata or {}).get("vector")
         if not vector:
+            continue
+        # A chunk embedded by a different model lives in a different vector
+        # space. Comparing across the two produces a number that looks like a
+        # similarity and means nothing, so those chunks are skipped rather than
+        # quietly ranked. `scripts/reindex_embeddings.py` brings them back.
+        if len(vector) != len(q_vec):
+            skipped += 1
             continue
         score = cosine_similarity(q_vec, vector)
         if score >= min_score:
@@ -146,6 +176,10 @@ def index_investigation_report(db: Session, investigation: Investigation, report
 
     return index_document(
         db,
+        # A past report belongs to whoever ran the investigation. Without this
+        # it is ownerless, and every other account sees it in their knowledge
+        # base and retrieves it while planning their own investigations.
+        owner_id=investigation.owner_id,
         title=f"Investigation report: {investigation.question[:120]}",
         text="\n".join(p for p in parts if p),
         document_type="past_report",
@@ -197,11 +231,20 @@ def past_feedback_for_driver(db: Session, driver_text: str,
             "useful": useful, "not_useful": not_useful, "examples": examples}
 
 
-def get_business_definition(db: Session, term: str) -> dict | None:
+# A similarity below this is not a definition, it is the nearest thing in the
+# index. Without a floor, every word in the question comes back "defined" by
+# whatever chunk happened to rank first, and the report then claims it consulted
+# a definition of "recently".
+MIN_DEFINITION_SCORE = 0.35
+
+
+def get_business_definition(db: Session, term: str, owner_id=None) -> dict | None:
     """Proposal Sec.9 - get_business_definition(term)."""
-    hits = search(db, term, top_k=3, document_type="kpi_definition")
+    hits = search(db, term, top_k=3, document_type="kpi_definition",
+                  min_score=MIN_DEFINITION_SCORE, owner_id=owner_id)
     if not hits:
-        hits = search(db, term, top_k=3, document_type="data_dictionary")
+        hits = search(db, term, top_k=3, document_type="data_dictionary",
+                      min_score=MIN_DEFINITION_SCORE, owner_id=owner_id)
     if not hits:
         return None
     best = hits[0]

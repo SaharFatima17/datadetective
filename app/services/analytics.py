@@ -21,7 +21,7 @@ from app.services.profiling import parse_datetimes
 from app.config import settings
 
 ALLOWED_OPS = {"describe", "value_counts", "groupby_aggregate", "correlation",
-               "time_series", "period_contribution"}
+               "time_series", "period_contribution", "interaction_contribution"}
 ALLOWED_AGGS = {"sum", "mean", "median", "count", "min", "max", "std", "nunique"}
 
 # pandas 2.2 renamed the month/quarter/year offsets; accept the old spellings
@@ -155,8 +155,15 @@ def run_dataframe_op(df: pd.DataFrame, operation: str, params: dict) -> dict:
             })
         rows.sort(key=lambda r: r["contribution_to_total_change_pct"], reverse=True)
 
+        seasonality = _seasonal_check(tmp, date_col, metric, by, cutoff,
+                                      rows[0]["group"] if rows else None)
+        for row in rows:
+            row["contribution_ci"] = _contribution_interval(
+                tmp, date_col, metric, by, cutoff, row["group"])
+
         return {
             "operation": "period_contribution",
+            "seasonality": seasonality,
             "by": by,
             "metric": metric,
             "split_date": str(cutoff.date()),
@@ -170,7 +177,195 @@ def run_dataframe_op(df: pd.DataFrame, operation: str, params: dict) -> dict:
             ),
         }
 
+    if operation == "interaction_contribution":
+        # Refining an answer, not competing with it.
+        #
+        # Testing one column at a time gives "the decline is in the South". That
+        # is true and often where the investigation stops — but "the South" may
+        # be four products of which one collapsed and three are fine. Acting on
+        # "the South" then spends effort on three healthy products.
+        #
+        # So this takes the group a single-column analysis already identified
+        # and asks whether, inside it, the movement sits in one value of a
+        # second column. It reports only when it does; otherwise the simpler
+        # statement is the honest one.
+        date_col = _require(params, "date_column")
+        metric = _require(params, "metric")
+        dims = params.get("by") or []
+        if len(dims) < 2:
+            raise ValueError("interaction_contribution needs two columns in 'by'")
+        primary, secondary = dims[0], dims[1]
+
+        tmp = df[[date_col, metric, primary, secondary]].copy()
+        tmp[date_col] = parse_datetimes(tmp[date_col])
+        tmp = tmp.dropna(subset=[date_col])
+        if tmp.empty:
+            raise ValueError("No parseable dates in the date column")
+
+        outer = run_dataframe_op(
+            tmp, "period_contribution",
+            {"date_column": date_col, "metric": metric, "by": primary,
+             "split": params.get("split")})
+        if not outer["result"]:
+            raise ValueError("No groups to analyse")
+
+        lead = outer["result"][0]
+        inside = tmp[tmp[primary].astype(str) == str(lead["group"])]
+        if inside.empty:
+            raise ValueError("Leading group has no rows")
+
+        inner = run_dataframe_op(
+            inside, "period_contribution",
+            {"date_column": date_col, "metric": metric, "by": secondary,
+             "split": outer["split_date"]})
+
+        top_inner = inner["result"][0] if inner["result"] else None
+        inner_share = top_inner["contribution_to_total_change_pct"] if top_inner else 0.0
+        n_values = len(inner["result"])
+        even = 100.0 / n_values if n_values else 100.0
+
+        # Concentrated means one value carries far more than an even split, and
+        # there was more than one value to begin with.
+        concentrated = bool(top_inner and n_values > 1
+                            and inner_share > max(60.0, even * 1.8))
+
+        return {
+            "operation": "interaction_contribution",
+            "by": [primary, secondary],
+            "metric": metric,
+            "split_date": outer["split_date"],
+            "direction": outer["direction"],
+            "leading_group": lead["group"],
+            "leading_group_share_pct": lead["contribution_to_total_change_pct"],
+            "within_leading_group": inner["result"][:8],
+            "refined_to": (f"{lead['group']} × {top_inner['group']}"
+                           if concentrated else None),
+            "refined_share_within_group_pct": round(float(inner_share), 2),
+            "values_examined": n_values,
+            "worth_reporting": concentrated,
+            "note": (
+                f"Of the {outer['direction']} inside {primary} = "
+                f"'{lead['group']}', this is how it splits across {secondary}. "
+                "Reported only when one value carries most of it; otherwise the "
+                "single-column statement is the accurate one."
+            ),
+        }
+
     raise ValueError(f"Unhandled operation: {operation}")
+
+
+def _seasonal_check(tmp, date_col: str, metric: str, by: str,
+                    cutoff, top_group) -> dict:
+    """Does the change survive a like-for-like comparison with a year earlier?
+
+    Every finding this system produces carries the caveat that seasonality is
+    not controlled for, and until now nothing acted on it. A drop that appears
+    every December is not a cause, it is a calendar.
+
+    The test is deliberately plain: compare the same months one year apart. It
+    needs no model, no assumption about the shape of the season, and it is easy
+    to explain — which matters more here than a decomposition nobody can check.
+    """
+    if top_group is None:
+        return {"checked": False, "reason": "no group to test"}
+
+    series = tmp[tmp[by].astype(str) == str(top_group)]
+    if series.empty:
+        return {"checked": False, "reason": "group not found"}
+
+    monthly = (series.set_index(date_col)[metric]
+               .resample("ME").sum().sort_index())
+    if len(monthly) < 24:
+        return {
+            "checked": False,
+            "reason": (f"only {len(monthly)} months of data; a year-on-year "
+                       "comparison needs at least 24"),
+        }
+
+    current = monthly[monthly.index >= cutoff]
+    if current.empty:
+        return {"checked": False, "reason": "no months after the split"}
+
+    # the same calendar months, one year earlier
+    pairs = []
+    for period, value in current.items():
+        prior = period - pd.DateOffset(years=1)
+        match = monthly[(monthly.index.year == prior.year)
+                        & (monthly.index.month == prior.month)]
+        if not match.empty:
+            pairs.append((float(value), float(match.iloc[0])))
+
+    if len(pairs) < 2:
+        return {"checked": False,
+                "reason": "not enough matching months a year earlier"}
+
+    now = sum(p[0] for p in pairs)
+    year_ago = sum(p[1] for p in pairs)
+    yoy = ((now - year_ago) / year_ago * 100) if year_ago else None
+
+    return {
+        "checked": True,
+        "months_compared": len(pairs),
+        "same_months_last_year": round(year_ago, 2),
+        "same_months_this_year": round(now, 2),
+        "year_on_year_pct": round(yoy, 2) if yoy is not None else None,
+        "survives": bool(yoy is not None and yoy < -5),
+        "note": (
+            "Compares the same calendar months a year apart, so a pattern that "
+            "repeats every year cancels out. A change that survives this is not "
+            "explained by the season alone."
+        ),
+    }
+
+
+def _contribution_interval(tmp, date_col: str, metric: str, by: str,
+                           cutoff, group, draws: int = 200) -> dict | None:
+    """A range around a group's share of the movement.
+
+    The share is computed from a sample of rows, so it is an estimate. Reporting
+    94.27% with no interval reads as a measurement rather than an estimate —
+    and this project reports a band around its forecasts for exactly the same
+    reason. Resampling rows with replacement gives the spread without assuming
+    any distribution.
+    """
+    import numpy as np
+
+    # Real exports carry missing values. A single NaN propagates through the
+    # resampled sums and comes out the other end as a NaN interval, which is
+    # not valid JSON and takes the whole investigation down with it. Drop them
+    # here rather than discovering it at the database.
+    clean = tmp.dropna(subset=[metric])
+    before = clean[clean[date_col] < cutoff]
+    after = clean[clean[date_col] >= cutoff]
+    if len(before) < 30 or len(after) < 30:
+        return None            # too few rows for the spread to mean anything
+
+    rng = np.random.default_rng(17)          # fixed: the same data gives the same band
+    prev_periods = max(before[date_col].dt.to_period("M").nunique(), 1)
+    curr_periods = max(after[date_col].dt.to_period("M").nunique(), 1)
+    mask_b = before[by].astype(str) == str(group)
+    mask_a = after[by].astype(str) == str(group)
+    vals_b, vals_a = before[metric].to_numpy(), after[metric].to_numpy()
+    grp_b, grp_a = mask_b.to_numpy(), mask_a.to_numpy()
+
+    shares = []
+    for _ in range(draws):
+        ib = rng.integers(0, len(vals_b), len(vals_b))
+        ia = rng.integers(0, len(vals_a), len(vals_a))
+        prev_g = vals_b[ib][grp_b[ib]].sum() / prev_periods
+        curr_g = vals_a[ia][grp_a[ia]].sum() / curr_periods
+        total = vals_a[ia].sum() / curr_periods - vals_b[ib].sum() / prev_periods
+        if total and np.isfinite(total):
+            shares.append((curr_g - prev_g) / total * 100)
+
+    shares = [x for x in shares if np.isfinite(x)]
+    if len(shares) < draws // 2:
+        return None
+    low, high = np.percentile(shares, [2.5, 97.5])
+    if not (np.isfinite(low) and np.isfinite(high)):
+        return None
+    return {"low": round(float(low), 1), "high": round(float(high), 1),
+            "method": f"bootstrap, {draws} resamples, 95% interval"}
 
 
 def _require(params: dict, key: str):
@@ -330,13 +525,28 @@ def render_chart(df: pd.DataFrame, spec: dict, output_dir: Path) -> str:
 
     fig, ax = plt.subplots(figsize=(9, 5))
 
+    def _readable_axis(axis) -> None:
+        """Print 120,000 rather than 1.2 with a '1e5' hidden in the corner.
+
+        Matplotlib's offset notation is easy to crop out of an embedded image,
+        and a chart whose axis silently reads 0.00 to 1.00 when the values are
+        hundreds of thousands is worse than no chart.
+        """
+        from matplotlib.ticker import FuncFormatter
+
+        axis.ticklabel_format(style="plain", axis="y")
+        axis.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.0f}"))
+
     if chart_type == "bar":
         x, y = spec["x"], spec["y"]
         agg = spec.get("agg", "sum")
         data = df.groupby(x)[y].agg(agg).sort_values(ascending=False).head(20)
-        ax.bar([str(i) for i in data.index], data.values, color="#4C72B0")
+        ax.bar([str(i) for i in data.index], data.values, color="#0a8f73")
         ax.set_xlabel(x)
         ax.set_ylabel(f"{agg}({y})")
+        ax.grid(axis="y", linestyle=":", alpha=0.4)
+        ax.set_axisbelow(True)
+        _readable_axis(ax)
         plt.xticks(rotation=45, ha="right")
 
     elif chart_type == "line":
@@ -383,6 +593,8 @@ def render_chart(df: pd.DataFrame, spec: dict, output_dir: Path) -> str:
 
     ax.set_title(title)
     ax.spines[["top", "right"]].set_visible(False)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
     fig.tight_layout()
     fig.savefig(path, dpi=110)
     plt.close(fig)

@@ -27,7 +27,8 @@ SYSTEM = (
 )
 
 
-def lookup_definitions(db: Session, question: str, columns: list[str]) -> dict:
+def lookup_definitions(db: Session, question: str, columns: list[str],
+                       owner_id=None) -> dict:
     """Retrieve business definitions relevant to the question (proposal Sec.14).
 
     Without this the RAG layer only ever sees past reports, and the
@@ -41,11 +42,17 @@ def lookup_definitions(db: Session, question: str, columns: list[str]) -> dict:
     for term in terms[:6] + columns[:8]:
         if term.lower() in found:
             continue
-        definition = rag.get_business_definition(db, term)
+        definition = rag.get_business_definition(db, term, owner_id=owner_id)
         if definition and definition.get("definition"):
             found[term.lower()] = definition
 
-    context = rag.search(db, question, top_k=3, document_type="business_doc")
+    # Uploaded documents and retrieved web pages are both background context.
+    # Indexing a page and then never consulting it would make URL ingestion a
+    # dead end, which is not what Sec.5 and Sec.7 describe.
+    context = rag.search(
+        db, question, top_k=3, document_type=["business_doc", "web_page"],
+        owner_id=owner_id,
+    )
     return {"definitions": list(found.values()), "context_passages": context}
 
 

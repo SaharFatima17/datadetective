@@ -356,19 +356,24 @@ def test_hypothesis(
                             f"({result['total_change_pct']}%)."
                             + (f" Welch t-test p={stat['p_value']:.4g}, "
                                f"Cohen's d={stat['cohens_d']}." if stat else "")
+                            + _season_sentence(result.get("seasonality"))
+                            + _interval_sentence(top.get("contribution_ci"))
                         ),
                         finding_type="driver",
                         magnitude=abs(float(top["change"])),
                         unit=metric,
-                        confidence="high" if (share > 50 and stat and stat.get("significant"))
-                        else "medium",
-                        caveats=(
-                            "Contribution shows where the change is concentrated, not why. "
-                            "Seasonality and period length are not controlled for beyond "
-                            "per-period normalisation."
-                        ),
+                        # A change that vanishes against the same months a year
+                        # earlier is a calendar, not a cause. It is not thrown
+                        # away — the measurement stands — but it must not be
+                        # presented with the same confidence as one that holds.
+                        confidence=_driver_confidence(share, stat,
+                                                      result.get("seasonality")),
+                        caveats=_driver_caveats(result.get("seasonality")),
                     )
                     db.add(finding)
+                    db.flush()
+                    _refine_driver(db, investigation, plan, metric, dim,
+                                   result["split_date"], finding)
 
             else:  # groupby_aggregate fallback - no date column available
                 top = result["result"][0]
@@ -534,6 +539,116 @@ def critique(db: Session, investigation: Investigation, findings: list[Finding])
 # ===================================================================== #
 # Verifier - deliberately NOT an LLM (Sec.7 step 20)
 # ===================================================================== #
+def _refine_driver(db, investigation, plan: dict, metric: str, primary: str,
+                   split: str, parent) -> None:
+    """Narrow a driver to a pair of columns when the movement sits in one cell.
+
+    "The decline is in the South" is true and often where an analysis stops.
+    But the South may be four products of which one collapsed and three are
+    healthy — and acting on "the South" then spends effort on the three. This
+    looks one level deeper and records a second finding only when the movement
+    really is concentrated there.
+    """
+    others = [d for d in (plan.get("dimensions") or []) if d != primary]
+    if not others:
+        return
+
+    # "South, and within it product Y" and "product Y, and within it the South"
+    # are the same cell said twice. Refine once per investigation — the point is
+    # to narrow the leading answer, not to restate it from every angle.
+    already = (
+        db.query(Finding)
+        .filter(Finding.investigation_id == investigation.id,
+                Finding.evidence_summary.like("interaction_contribution%"))
+        .first()
+    )
+    if already:
+        return
+
+    result, run = registry.call_tool(
+        db, "run_dataframe_code",
+        {"dataset_id": str(investigation.dataset_id),
+         "version_id": str(investigation.version_id),
+         "operation": "interaction_contribution",
+         "params": {"date_column": plan["date_column"], "metric": metric,
+                    "by": [primary, others[0]], "split": split}},
+        investigation_id=investigation.id, agent_name="analysis")
+
+    if run.status != "success" or not result.get("worth_reporting"):
+        return
+
+    inner = result["within_leading_group"][0]
+    db.add(Finding(
+        investigation_id=investigation.id,
+        hypothesis_id=parent.hypothesis_id,
+        tool_run_id=run.id,
+        statement=(
+            f"Within {primary} = '{result['leading_group']}', the "
+            f"{result['direction']} is concentrated in {others[0]} = "
+            f"'{inner['group']}' ({result['refined_share_within_group_pct']}% of "
+            f"that group's movement)."
+        ),
+        finding_type="driver",
+        evidence_summary=(
+            f"interaction_contribution({metric} by {primary} then {others[0]}, "
+            f"split {result['split_date']}) across {result['values_examined']} "
+            f"values of {others[0]}."
+        ),
+        magnitude=abs(float(inner.get("change") or 0)),
+        unit=metric,
+        confidence=parent.confidence,
+        verification_status="pending",
+        caveats=(
+            "This narrows where the movement sits; it still does not say why. "
+            "It is reported only because one value carries most of the change — "
+            "had it been spread evenly, the broader statement would stand alone."
+        ),
+    ))
+
+
+def _season_sentence(seasonality: dict | None) -> str:
+    if not seasonality or not seasonality.get("checked"):
+        return ""
+    yoy = seasonality.get("year_on_year_pct")
+    if yoy is None:
+        return ""
+    verdict = ("which is not explained by the season alone"
+               if seasonality.get("survives")
+               else "which is roughly flat, so the season accounts for most of it")
+    return (f" Against the same {seasonality['months_compared']} calendar months "
+            f"a year earlier the change is {yoy}%, {verdict}.")
+
+
+def _interval_sentence(ci: dict | None) -> str:
+    if not ci:
+        return ""
+    return (f" The share is an estimate: 95% interval "
+            f"{ci['low']}% to {ci['high']}% ({ci['method']}).")
+
+
+def _driver_confidence(share: float, stat: dict | None,
+                       seasonality: dict | None) -> str:
+    if seasonality and seasonality.get("checked") and not seasonality.get("survives"):
+        return "low"
+    if share > 50 and stat and stat.get("significant"):
+        return "high"
+    return "medium"
+
+
+def _driver_caveats(seasonality: dict | None) -> str:
+    base = "Contribution shows where the change is concentrated, not why. "
+    if not seasonality or not seasonality.get("checked"):
+        reason = (seasonality or {}).get("reason", "not enough history")
+        return (base + "Seasonality could not be ruled out: " + reason + ". "
+                "Period length is normalised, the season is not.")
+    if seasonality.get("survives"):
+        return (base + "The change does survive a like-for-like comparison with "
+                "the same months a year earlier, so it is not the season alone.")
+    return (base + "Against the same months a year earlier this change is close "
+            "to flat, so most of it is seasonal. Treat this as a pattern that "
+            "repeats, not a new cause.")
+
+
 def verify_findings(db: Session, findings: list[Finding]) -> list[dict]:
     """Re-executes each finding's recorded tool run and compares checksums."""
     results = []
@@ -555,7 +670,8 @@ def verify_findings(db: Session, findings: list[Finding]) -> list[dict]:
 # History / Comparison Agent (Sec.14, Sec.7 steps 18 & 21)
 # ===================================================================== #
 def compare_with_history(db: Session, investigation: Investigation, findings: list[Finding]) -> dict:
-    prior = rag.search(db, investigation.question, top_k=3, document_type="past_report")
+    prior = rag.search(db, investigation.question, top_k=3,
+                       document_type="past_report", owner_id=investigation.owner_id)
     prior = [p for p in prior
              if (p.get("document_title") or "") and str(investigation.id) not in str(p)]
 

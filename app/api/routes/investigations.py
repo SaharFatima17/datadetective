@@ -14,6 +14,7 @@ from app.core.deps import (
 )
 from app.database import get_db
 from app.models import (
+    InvestigationComparison,
     Feedback,
     Finding,
     Hypothesis,
@@ -64,7 +65,7 @@ def list_investigations(user: User = Depends(get_current_user),
     query = db.query(Investigation)
     if user.role != "admin":
         query = query.filter(
-            (Investigation.owner_id == user.id) | (Investigation.owner_id.is_(None))
+            Investigation.owner_id == user.id
         )
     rows = query.order_by(Investigation.created_at.desc()).all()
     return {"count": len(rows), "investigations": [
@@ -213,6 +214,45 @@ def get_report(investigation_id: uuid.UUID, user: User = Depends(get_current_use
         raise HTTPException(404, "No report yet for this investigation")
     return {"id": str(report.id), "version": report.version_number, "title": report.title,
             "executive_summary": report.executive_summary, **(report.content or {})}
+
+
+@router.get("/{investigation_id}/comparison")
+def comparison(investigation_id: uuid.UUID,
+               user: User = Depends(get_current_user),
+               db: Session = Depends(get_db)):
+    """How this answer differs from the last one on the same data (Sec.14).
+
+    The comparison is computed when an investigation completes and stored, but
+    until now nothing read it back. A system that notices the cause has changed
+    since last quarter, and cannot tell anyone, is no better than one that never
+    noticed.
+    """
+    investigation = _get(db, investigation_id, user)
+    row = (
+        db.query(InvestigationComparison)
+        .filter(InvestigationComparison.current_investigation_id == investigation.id)
+        .order_by(InvestigationComparison.created_at.desc())
+        .first()
+    )
+    if not row:
+        return {"available": False,
+                "reason": "Nothing to compare against — this is the first "
+                          "completed investigation on this dataset."}
+
+    previous = db.get(Investigation, row.previous_investigation_id)
+    details = row.details or {}
+    return {
+        "available": True,
+        "driver_change": row.driver_change,
+        "summary": row.comparison_summary,
+        "previous_drivers": details.get("previous_drivers", []),
+        "current_drivers": details.get("current_drivers", []),
+        "previous_investigation": {
+            "id": str(previous.id),
+            "question": previous.question,
+            "created_at": previous.created_at,
+        } if previous else None,
+    }
 
 
 @router.get("/{investigation_id}/timeline")

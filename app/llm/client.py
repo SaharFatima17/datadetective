@@ -11,14 +11,20 @@ is what you use while building and testing everything below Phase 7.
 from __future__ import annotations
 
 import json
+import random
 import re
+import threading
+import time
 
 from app.config import settings
 
+# Starting points only. Model names are retired on a schedule, so set LLM_MODEL
+# in .env rather than relying on these — `scripts/list_models.py` prints the
+# names your own key can currently use.
 DEFAULT_MODELS = {
     "anthropic": "claude-sonnet-4-5",
     "openai": "gpt-4o-mini",
-    "gemini": "gemini-2.0-flash",
+    "gemini": "gemini-3.5-flash",
 }
 
 
@@ -26,11 +32,148 @@ class LLMError(RuntimeError):
     pass
 
 
+# Transient conditions worth retrying: rate limits, overload, gateway errors
+# and read timeouts. A 400 or 401 is not retried — the request itself is wrong,
+# and hammering the endpoint will not fix it.
+RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
+
+
+def _retry_after(response) -> float | None:
+    """How long the provider says to wait, if it says at all.
+
+    A 429 usually carries the answer. Guessing with exponential backoff when the
+    server has told you the exact delay wastes quota: retry too early and the
+    attempt is refused and counted, too late and a long run crawls.
+    """
+    header = response.headers.get("retry-after")
+    if header:
+        try:
+            return float(header)
+        except ValueError:
+            pass
+
+    # Google returns it inside the error body as e.g. {"retryDelay": "34s"}
+    try:
+        body = response.json()
+    except Exception:  # noqa: BLE001
+        return None
+    for item in (body.get("error", {}) or {}).get("details", []) or []:
+        delay = item.get("retryDelay")
+        if isinstance(delay, str) and delay.endswith("s"):
+            try:
+                return float(delay[:-1])
+            except ValueError:
+                pass
+    return None
+
+
+def _is_daily_quota(response) -> bool:
+    """Distinguish 'wait a minute' from 'come back tomorrow'.
+
+    Retrying a per-day quota just burns the retry budget for nothing, and the
+    run should stop with a message that says so.
+    """
+    text = response.text.lower()
+    return "per day" in text or "perday" in text or "daily" in text
+
+
+class _Pacer:
+    """Keeps calls at least `LLM_MIN_INTERVAL_MS` apart.
+
+    A free-tier key allows a fixed number of requests per minute. Without
+    pacing an evaluation run fires as fast as it can, trips the limit within
+    seconds, and then spends the rest of the run in backoff. Spacing the calls
+    is faster overall than being throttled.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._last = 0.0
+
+    def wait(self) -> None:
+        interval = settings.LLM_MIN_INTERVAL_MS / 1000
+        if interval <= 0:
+            return
+        with self._lock:
+            gap = time.monotonic() - self._last
+            if gap < interval:
+                time.sleep(interval - gap)
+            self._last = time.monotonic()
+
+
+_pacer = _Pacer()
+
+
 class LLMClient:
     def __init__(self) -> None:
         self.provider = settings.LLM_PROVIDER.lower()
         self.model = settings.LLM_MODEL or DEFAULT_MODELS.get(self.provider, "")
         self.api_key = settings.LLM_API_KEY
+        # Counted so an evaluation run can report how many calls it cost.
+        self.calls = 0
+        self.retries = 0
+
+    def _with_retries(self, fn, system: str, prompt: str) -> str:
+        """Call a provider, retrying transient failures with backoff.
+
+        Without this a single rate-limit response part-way through an
+        evaluation run discards every scenario already computed.
+        """
+        import httpx
+
+        attempts = max(1, settings.LLM_MAX_RETRIES)
+        last: Exception | None = None
+
+        for attempt in range(attempts):
+            _pacer.wait()
+            try:
+                self.calls += 1
+                return fn(system, prompt)
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+
+                if status == 429 and _is_daily_quota(exc.response):
+                    raise LLMError(
+                        f"{self.provider} daily quota is exhausted — retrying "
+                        "will not help today. Either wait for the quota to "
+                        "reset, use a key with a higher limit, or run fewer "
+                        "scenarios with --scenarios."
+                    ) from exc
+
+                if status not in RETRYABLE_STATUS or attempt == attempts - 1:
+                    detail = exc.response.text[:300]
+                    if status == 404:
+                        # Keep the provider's own words. An earlier version
+                        # replaced them with a guess about retired models,
+                        # which hid the real reason — a 404 here can also mean
+                        # the endpoint or API version is wrong, not the name.
+                        raise LLMError(
+                            f"{self.provider} returned 404 for model "
+                            f"'{self.model}'. The provider said: {detail}\n"
+                            "Run `python scripts/check_llm.py` to test the "
+                            "model directly and see the full response."
+                        ) from exc
+                    raise LLMError(
+                        f"{self.provider} returned {status}: {detail}"
+                    ) from exc
+                last = exc
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                if attempt == attempts - 1:
+                    raise LLMError(f"{self.provider} unreachable: {exc}") from exc
+                last = exc
+
+            # Prefer the provider's own figure; fall back to exponential
+            # backoff with jitter so parallel callers do not retry in lockstep
+            # and trip the limit again together.
+            told = None
+            if isinstance(last, httpx.HTTPStatusError):
+                told = _retry_after(last.response)
+            delay = told if told else min(30.0, (2 ** attempt) + random.uniform(0, 1))
+            delay = min(delay + random.uniform(0, 1), 120.0)
+            self.retries += 1
+            time.sleep(delay)
+
+        raise LLMError(f"{self.provider} failed after {attempts} attempts: {last}")
 
     # ------------------------------------------------------------------ #
     @staticmethod
@@ -58,11 +201,11 @@ class LLMClient:
                 f"LLM_PROVIDER is '{self.provider}' but LLM_API_KEY is empty in .env"
             )
         if self.provider == "anthropic":
-            return self._anthropic(system, prompt)
+            return self._with_retries(self._anthropic, system, prompt)
         if self.provider == "openai":
-            return self._openai(system, prompt)
+            return self._with_retries(self._openai, system, prompt)
         if self.provider == "gemini":
-            return self._gemini(system, prompt)
+            return self._with_retries(self._gemini, system, prompt)
         raise LLMError(f"Unknown LLM_PROVIDER: {self.provider}")
 
     def complete_json(self, system: str, prompt: str) -> dict | list:
@@ -132,8 +275,43 @@ class LLMClient:
             timeout=120,
         )
         r.raise_for_status()
-        parts = r.json()["candidates"][0]["content"]["parts"]
-        return "".join(p.get("text", "") for p in parts)
+        return _read_gemini(r.json(), self.model)
+
+
+def _read_gemini(body: dict, model: str) -> str:
+    """Pull the text out of a Gemini response, explaining an empty one.
+
+    Gemini 3.x models reason before they answer, and that reasoning is charged
+    against `maxOutputTokens`. When the budget runs out mid-thought the reply
+    comes back 200 OK with `finishReason: MAX_TOKENS` and no `parts` at all.
+    Indexing straight into `parts` raises a bare KeyError, which a caller then
+    reports as "[error: 'parts']" — true, and useless. The real problem is a
+    token budget, so say that.
+    """
+    candidates = body.get("candidates") or []
+    if not candidates:
+        blocked = (body.get("promptFeedback") or {}).get("blockReason")
+        if blocked:
+            raise LLMError(f"{model} refused the prompt: {blocked}")
+        raise LLMError(f"{model} returned no candidates: {str(body)[:200]}")
+
+    candidate = candidates[0]
+    parts = (candidate.get("content") or {}).get("parts") or []
+    text = "".join(p.get("text", "") for p in parts)
+    if text.strip():
+        return text
+
+    reason = candidate.get("finishReason", "unknown")
+    if reason == "MAX_TOKENS":
+        raise LLMError(
+            f"{model} used its entire {settings.LLM_MAX_TOKENS}-token budget "
+            "before producing any output. Newer Gemini models spend tokens "
+            "reasoning first, and that counts against the same budget. Raise "
+            "LLM_MAX_TOKENS in .env (8000 is a safe starting point)."
+        )
+    if reason == "SAFETY":
+        raise LLMError(f"{model} stopped on a safety filter.")
+    raise LLMError(f"{model} returned an empty response (finishReason: {reason}).")
 
 
 # ---------------------------------------------------------------------- #

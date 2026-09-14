@@ -64,7 +64,7 @@ async def upload_source(file: UploadFile = File(...),
         elif ext in ingestion.DOCUMENT_EXTS:
             artifact = next(a for a in source.artifacts if a.artifact_type == "original")
             text = ingestion.extract_text(Path(artifact.storage_path))
-            doc = rag.index_document(db, title=file.filename, text=text,
+            doc = rag.index_document(db, owner_id=user.id, title=file.filename, text=text,
                                      document_type="business_doc", source_id=source.id)
             source.status = "extracted"
             response.update(kind="document", document_id=str(doc.id),
@@ -109,7 +109,7 @@ def ingest_url(payload: URLIngestRequest,
         if payload.index_for_rag:
             artifact = source.artifacts[0]
             text = ingestion.extract_text(Path(artifact.storage_path))
-            doc = rag.index_document(db, title=payload.url, text=text,
+            doc = rag.index_document(db, owner_id=user.id, title=payload.url, text=text,
                                      document_type="web_page", source_id=source.id)
             source.status = "extracted"
             result.update(document_id=str(doc.id), chunks=len(doc.chunks))
@@ -125,7 +125,11 @@ def list_sources(user: User = Depends(get_current_user), db: Session = Depends(g
     query = db.query(DataSource).filter(DataSource.is_deleted.is_(False))
     if user.role != "admin":
         query = query.filter(
-            (DataSource.owner_id == user.id) | (DataSource.owner_id.is_(None))
+            # Rows with no owner are created by the evaluation scripts and by
+            # internal tooling. They used to be visible to everyone, which meant
+            # a brand new account opened onto someone else's workspace. They now
+            # belong to administrators only.
+            DataSource.owner_id == user.id
         )
     rows = query.all()
     return {"count": len(rows), "sources": [
@@ -140,7 +144,7 @@ def list_sources(user: User = Depends(get_current_user), db: Session = Depends(g
 def list_datasets(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     query = db.query(Dataset).filter(Dataset.is_deleted.is_(False))
     if user.role != "admin":
-        query = query.filter((Dataset.owner_id == user.id) | (Dataset.owner_id.is_(None)))
+        query = query.filter(Dataset.owner_id == user.id)
     rows = query.all()
     return {"count": len(rows), "datasets": [
         {"id": str(d.id), "name": d.name, "description": d.description,

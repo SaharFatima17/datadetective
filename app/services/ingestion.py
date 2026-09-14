@@ -400,13 +400,49 @@ def _extract_text(path: Path, ext: str) -> str:
     return path.read_text(encoding="utf-8", errors="ignore")
 
 
+# Many sites — Wikipedia among them — refuse requests that do not identify
+# themselves, and answer 403. Saying who we are is both their stated
+# requirement and the honest thing to do when retrieving someone's page.
+USER_AGENT = (
+    "DataDetective/1.0 (academic research project; "
+    "+https://github.com/datadetective) httpx"
+)
+
+
 def fetch_url(db: Session, url: str, owner_id: uuid.UUID | None = None) -> DataSource:
     """Retrieve permitted web content and keep a snapshot with provenance."""
     import httpx
 
-    resp = httpx.get(url, timeout=30, follow_redirects=True)
-    resp.raise_for_status()
+    if not url.lower().startswith(("http://", "https://")):
+        raise ValueError("The address must start with http:// or https://")
+
+    try:
+        resp = httpx.get(
+            url,
+            timeout=30,
+            follow_redirects=True,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en",
+            },
+        )
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        code = exc.response.status_code
+        reason = {
+            401: "the page requires a login",
+            403: "the site refused the request — it may block automated access",
+            404: "there is no page at that address",
+            429: "the site is rate-limiting us; try again in a minute",
+        }.get(code, f"the site returned {code}")
+        raise ValueError(f"Could not retrieve that page: {reason}.") from exc
+    except httpx.HTTPError as exc:
+        raise ValueError(f"Could not reach that address: {exc}") from exc
+
     content = resp.content
+    if not content.strip():
+        raise ValueError("That page returned nothing to index.")
 
     source = DataSource(
         owner_id=owner_id,
@@ -418,7 +454,9 @@ def fetch_url(db: Session, url: str, owner_id: uuid.UUID | None = None) -> DataS
         size_bytes=len(content),
         retrieved_at=datetime.now(timezone.utc),
         status="registered",
-        source_metadata={"status_code": resp.status_code},
+        source_metadata={"status_code": resp.status_code,
+                         "content_type": resp.headers.get("content-type", ""),
+                         "final_url": str(resp.url)},
     )
     db.add(source)
     db.flush()

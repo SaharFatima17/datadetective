@@ -108,7 +108,7 @@ def forecast(dataset_id: uuid.UUID, payload: ForecastRequest,
 def index_document(payload: DocumentIndexRequest,
                    user: User = Depends(require_role("admin", "analyst")),
                    db: Session = Depends(get_db)):
-    doc = rag.index_document(db, title=payload.title, text=payload.text,
+    doc = rag.index_document(db, owner_id=user.id, title=payload.title, text=payload.text,
                              document_type=payload.document_type, metadata=payload.metadata)
     db.commit()
     return {"document_id": str(doc.id), "title": doc.title,
@@ -117,7 +117,12 @@ def index_document(payload: DocumentIndexRequest,
 
 @router.get("/documents")
 def list_documents(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    rows = db.query(Document).all()
+    # This had no filter at all: every account saw every document, including
+    # reports written for other people's investigations.
+    query = db.query(Document)
+    if user.role != "admin":
+        query = query.filter(Document.owner_id == user.id)
+    rows = query.all()
     return {"count": len(rows), "documents": [
         {"id": str(d.id), "title": d.title, "type": d.document_type,
          "status": d.status, "chunks": len(d.chunks), "created_at": d.created_at}
@@ -125,18 +130,51 @@ def list_documents(user: User = Depends(get_current_user), db: Session = Depends
     ]}
 
 
+@router.delete("/documents/{document_id}")
+def delete_document(document_id: uuid.UUID,
+                    user: User = Depends(require_role("admin", "analyst")),
+                    db: Session = Depends(get_db)):
+    """Remove a document from retrieval.
+
+    A page fetched by mistake stays in the agents' context for every future
+    investigation, quietly shaping plans with something irrelevant. There has
+    to be a way to take it back out.
+
+    The deletion is real: the chunks and their vectors go too, because a
+    soft-deleted chunk would still be returned by a similarity search. The
+    stored snapshot under the original source is left alone — that is the
+    provenance record of what was retrieved, and findings already made may
+    still point at it.
+    """
+    doc = db.get(Document, document_id)
+    if not doc:
+        raise HTTPException(404, "No such document")
+    if doc.owner_id and doc.owner_id != user.id and user.role != "admin":
+        raise HTTPException(403, "This document belongs to another user")
+
+    title, chunks = doc.title, len(doc.chunks)
+    db.delete(doc)          # chunks cascade with it
+    db.commit()
+    return {"deleted": True, "title": title, "chunks_removed": chunks}
+
+
 @router.post("/search")
 def search(payload: SearchRequest, user: User = Depends(get_current_user),
            db: Session = Depends(get_db)):
+    # Scoped to the caller, like every other listing. An administrator sees
+    # everything, which is what makes the evaluation data reachable.
     return {"query": payload.query,
-            "results": rag.search(db, payload.query, top_k=payload.top_k,
-                                  document_type=payload.document_type)}
+            "results": rag.search(
+                db, payload.query, top_k=payload.top_k,
+                document_type=payload.document_type,
+                owner_id=None if user.role == "admin" else user.id)}
 
 
 @router.get("/definitions/{term}")
 def definition(term: str, user: User = Depends(get_current_user),
                db: Session = Depends(get_db)):
-    return registry.get_business_definition(db, term)
+    return rag.get_business_definition(
+        db, term, owner_id=None if user.role == "admin" else user.id)
 
 
 # ===================== tool layer (Phase 8 surface) ================== #

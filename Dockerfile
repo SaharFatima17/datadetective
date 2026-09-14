@@ -18,4 +18,6 @@ RUN mkdir -p storage
 EXPOSE 8000
 
 # Migrations run at container start so a fresh database is usable immediately.
-CMD alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000
+# The port comes from the environment because hosting platforms assign one and
+# expect the process to bind to it; 8000 is only the local default.
+CMD alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}

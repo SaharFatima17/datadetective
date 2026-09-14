@@ -58,10 +58,14 @@ def _summary(db: Session, dataset: Dataset) -> tuple[dict, object]:
 def _result(system: str, question: str, answer: str, started: float,
             findings: list[dict] | None = None, tool_calls: int = 0,
             llm_calls: int = 0, prompt_chars: int = 0,
-            asked_for_evidence: bool = False) -> dict:
+            asked_for_evidence: bool = False,
+            stop_reason: str | None = None,
+            steps: list[dict] | None = None) -> dict:
     return {
         "system": system,
         "question": question,
+        "stop_reason": stop_reason,
+        "steps": steps or [],
         "answer": answer,
         "findings": findings or [],
         "tool_calls": tool_calls,
@@ -135,6 +139,13 @@ def _run_single_agent(db: Session, dataset_id: uuid.UUID, question: str,
     summary, _ = _summary(db, dataset)
 
     transcript: list[str] = []
+    # What the agent did at each step, so a run that ends without an answer can
+    # be explained rather than just scored zero. A baseline that failed because
+    # it kept asking for tools it did not have is a different result from one
+    # that reasoned its way to the wrong cause, and the comparison is only
+    # defensible if the two can be told apart.
+    steps: list[dict] = []
+    stop_reason = "step_budget_exhausted"
     tool_calls = llm_calls = prompt_chars = 0
     last_run_id = None
     answer = None
@@ -157,16 +168,28 @@ def _run_single_agent(db: Session, dataset_id: uuid.UUID, question: str,
             step = llm.complete_json(system=AGENT_SYSTEM, prompt=prompt)
         except Exception as exc:  # noqa: BLE001
             answer = f"[error: {exc}]"
+            stop_reason = "llm_error"
+            steps.append({"outcome": "llm_error", "detail": str(exc)[:200]})
             break
 
-        if not isinstance(step, dict) or step.get("action") == "answer":
-            answer = str((step or {}).get("cause", ""))
-            confidence = str((step or {}).get("confidence", "medium"))
-            evidence = str((step or {}).get("evidence", ""))
+        if not isinstance(step, dict):
+            # Unparseable output still costs a step; recording it separates a
+            # model that could not follow the format from one that reasoned badly.
+            steps.append({"outcome": "unparseable_step"})
+            transcript.append("Previous reply was not valid JSON. Reply with JSON only.")
+            continue
+
+        if step.get("action") == "answer":
+            answer = str(step.get("cause", ""))
+            confidence = str(step.get("confidence", "medium"))
+            evidence = str(step.get("evidence", ""))
+            stop_reason = "answered"
+            steps.append({"outcome": "answered"})
             break
 
         name = step.get("tool")
         if name not in tools:
+            steps.append({"outcome": "unavailable_tool", "tool": str(name)})
             transcript.append(f"Tool '{name}' is not available.")
             continue
 
@@ -174,6 +197,7 @@ def _run_single_agent(db: Session, dataset_id: uuid.UUID, question: str,
         params.setdefault("dataset_id", str(dataset_id))
         result, run = registry.call_tool(db, name, params, agent_name=system_name)
         tool_calls += 1
+        steps.append({"outcome": "tool_" + run.status, "tool": name})
         if run.status == "success":
             last_run_id = run.id
         transcript.append(f"{name}({params}) -> {json.dumps(result, default=str)[:900]}")
@@ -190,6 +214,7 @@ def _run_single_agent(db: Session, dataset_id: uuid.UUID, question: str,
                    "verification_status": "pending",
                    "tool_run_id": str(last_run_id) if last_run_id else None}],
         tool_calls=tool_calls, llm_calls=llm_calls, prompt_chars=prompt_chars,
+        stop_reason=stop_reason, steps=steps,
     )
 
 

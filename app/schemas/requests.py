@@ -105,6 +105,15 @@ class ResumeRequest(BaseModel):
     response: str
 
 
+class ConversationCreate(BaseModel):
+    title: str | None = None
+    dataset_id: str | None = None
+
+
+class ChatMessageRequest(BaseModel):
+    content: str
+
+
 class FeedbackRequest(BaseModel):
     rating: str = Field(..., description="useful | not_useful")
     notes: str | None = None

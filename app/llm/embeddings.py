@@ -15,8 +15,12 @@ from app.config import settings
 
 DEFAULT_EMBEDDING_MODELS = {
     "openai": "text-embedding-3-small",
-    "gemini": "text-embedding-004",
+    "gemini": "gemini-embedding-001",
 }
+
+
+class EmbeddingError(RuntimeError):
+    pass
 
 
 class Embedder:
@@ -26,6 +30,17 @@ class Embedder:
             self.provider, ""
         )
         self.api_key = settings.EMBEDDING_API_KEY or settings.LLM_API_KEY
+
+    @property
+    def signature(self) -> str:
+        """Identifies the vector space these embeddings belong to.
+
+        Vectors from different models are not comparable — different dimensions,
+        and even at equal dimensions the axes mean different things. Storing the
+        signature with each chunk is what lets retrieval notice the mismatch
+        instead of silently returning nonsense similarities.
+        """
+        return f"{self.provider}:{self.model or 'default'}"
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         if self.provider == "mock":
@@ -58,9 +73,38 @@ class Embedder:
             f"https://generativelanguage.googleapis.com/v1beta/models/"
             f"{self.model}:embedContent?key={self.api_key}"
         )
-        r = httpx.post(url, json={"content": {"parts": [{"text": text}]}}, timeout=120)
-        r.raise_for_status()
+        r = self._request(
+            httpx, url, {"content": {"parts": [{"text": text}]}}
+        )
         return r.json()["embedding"]["values"]
+
+    def _request(self, httpx, url: str, payload: dict):
+        """POST with backoff. Indexing a document is dozens of calls in a row,
+        so a free-tier rate limit is met on the first document, not the tenth."""
+        import random
+        import time
+
+        attempts = max(1, settings.LLM_MAX_RETRIES)
+        for attempt in range(attempts):
+            interval = settings.LLM_MIN_INTERVAL_MS / 1000
+            if interval and attempt == 0:
+                time.sleep(interval)
+            r = httpx.post(url, json=payload, timeout=120)
+            if r.status_code == 200:
+                return r
+            if r.status_code == 404:
+                raise EmbeddingError(
+                    f"{self.provider} has no embedding model called "
+                    f"'{self.model}'. Run `python scripts/list_models.py` and "
+                    "set EMBEDDING_MODEL in .env."
+                )
+            if r.status_code not in (408, 429, 500, 502, 503, 504) or attempt == attempts - 1:
+                raise EmbeddingError(
+                    f"{self.provider} embeddings returned {r.status_code}: "
+                    f"{r.text[:200]}"
+                )
+            time.sleep(min(30.0, 2 ** attempt + random.uniform(0, 1)))
+        raise EmbeddingError("unreachable")
 
 
 def _mock_embed(text: str) -> list[float]:

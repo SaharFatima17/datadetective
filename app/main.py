@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.api.routes import analytics, auth, data, health, investigations
+from app.api.routes import analytics, auth, chat, data, health, investigations
 from app.config import settings
 
 @asynccontextmanager
@@ -24,8 +24,11 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    # Authentication is a bearer token in a header, not a cookie, so
+    # credentials are not needed — and with them enabled a wildcard origin is
+    # rejected by browsers anyway.
+    allow_origins=[o.strip() for o in settings.ALLOWED_ORIGINS.split(",") if o.strip()],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -35,6 +38,7 @@ app.include_router(auth.router)
 app.include_router(data.router)
 app.include_router(analytics.router)
 app.include_router(investigations.router)
+app.include_router(chat.router)
 
 STATIC_DIR = Path(__file__).parent.parent / "static"
 if STATIC_DIR.exists():

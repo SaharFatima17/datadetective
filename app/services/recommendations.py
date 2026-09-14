@@ -108,7 +108,9 @@ def generate_recommendations(
         # Historical grounding (proposal Sec.13 point 4): past reports for
         # context, and past FEEDBACK on similar drivers for whether the action
         # actually helped last time.
-        prior = rag.search(db, finding.statement, top_k=2, document_type="past_report")
+        prior = rag.search(db, finding.statement, top_k=2,
+                           document_type="past_report",
+                           owner_id=investigation.owner_id)
         history = rag.past_feedback_for_driver(db, finding.statement)
 
         notes = []

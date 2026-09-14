@@ -123,7 +123,8 @@ def _run_investigation(db: Session, investigation: Investigation,
     definitions = (
         supervisor.lookup_definitions(
             db, investigation.question,
-            [c["name"] for c in profile.get("columns", [])])
+            [c["name"] for c in profile.get("columns", [])],
+            owner_id=investigation.owner_id)
         if enabled["rag"] else None
     )
     plan = supervisor.choose_columns(investigation.question, profile, definitions)
@@ -263,6 +264,37 @@ def _run_investigation(db: Session, investigation: Investigation,
                                  _conf_rank.get(f.confidence, 3),
                                  -abs(f.magnitude or 0)))
 
+    # --- chart for the leading driver --------------------------------- #
+    # A driver finding says one group carries the movement. A reader checks
+    # that claim far faster from a picture than from a sentence, so the same
+    # breakdown the finding rests on is rendered once, through the normal tool
+    # path so the image is logged and attributable like any other result.
+    charts: list[dict] = []
+    lead = next((f for f in verified if f.finding_type == "driver"), None)
+    if lead and plan.get("date_column"):
+        by = (lead.variables or {}).get("by") if hasattr(lead, "variables") else None
+        by = by or next(
+            (c for c in (plan.get("dimensions") or [])
+             if c and c.lower() in (lead.statement or "").lower()), None)
+        if by:
+            try:
+                result, run = registry.call_tool(
+                    db, "render_chart",
+                    {"dataset_id": str(investigation.dataset_id),
+                     "version_id": str(investigation.version_id),
+                     "spec": {"type": "bar", "x": by, "y": plan["target_metric"],
+                              "agg": "sum",
+                              "title": f"{plan['target_metric']} by {by}"},
+                     "investigation_id": str(investigation.id)},
+                    investigation_id=investigation.id, agent_name="reporting")
+                if run.status == "success":
+                    charts.append({"id": result["chart_id"], "type": result["type"],
+                                   "title": f"{plan['target_metric']} by {by}",
+                                   "dimension": by})
+            except Exception:  # noqa: BLE001
+                # A missing picture must never cost the finding behind it.
+                pass
+
     # --- step 22: forecast ------------------------------------------- #
     forecasts: dict[str, Forecast] = {}
     # The observed series is kept alongside the projection so the report can
@@ -315,7 +347,7 @@ def _run_investigation(db: Session, investigation: Investigation,
     # --- step 23: report --------------------------------------------- #
     report = _build_report(db, investigation, verified, hypotheses, recs,
                            list(forecasts.values()), critique_result, history,
-                           verification, plan, histories)
+                           verification, plan, histories, charts)
 
     # --- step 24: persist for future retrieval ----------------------- #
     rag.index_investigation_report(db, investigation, report)
@@ -479,9 +511,10 @@ def _apply_period_scope(df, investigation: Investigation):
 
 def _build_report(db, investigation, findings, hypotheses, recs, forecasts,
                   critique_result, history, verification, plan=None,
-                  histories=None) -> Report:
+                  histories=None, charts=None) -> Report:
     plan = plan or {}
     histories = histories or {}
+    charts = charts or []
     existing = db.query(Report).filter(Report.investigation_id == investigation.id).count()
     summary = agents.write_summary(investigation, findings, critique_result)
 
@@ -530,6 +563,10 @@ def _build_report(db, investigation, findings, hypotheses, recs, forecasts,
         ],
         "recommendations": [
             {
+                # the id is what lets a client record feedback against this
+                # exact recommendation; without it the card can render but the
+                # thumbs-up has nothing to point at
+                "id": str(r.id),
                 "rank": r.rank,
                 "action": r.action,
                 "rationale": r.rationale,
@@ -537,11 +574,13 @@ def _build_report(db, investigation, findings, hypotheses, recs, forecasts,
                 "impact_method": r.impact_method,
                 "confidence": r.confidence,
                 "urgency": r.urgency,
+                "user_decision": r.user_decision,
             }
             for r in recs
         ],
         "critique": critique_result,
         "historical_comparison": history,
+        "charts": charts,
         "retrieval": {
             "definitions_used": plan.get("definitions_used", []),
             "context_documents": plan.get("context_documents", []),
