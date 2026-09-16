@@ -121,7 +121,28 @@ def run_dataframe_op(df: pd.DataFrame, operation: str, params: dict) -> dict:
         if tmp.empty:
             raise ValueError("No parseable dates in the date column")
 
-        cutoff = pd.Timestamp(split) if split else tmp[date_col].quantile(0.67)
+        if split:
+            cutoff = pd.Timestamp(split)
+            split_method = "supplied"
+            split_strength = None
+        else:
+            # Month START labels, not month end. A period labelled 2024-06-30
+            # is June, but using that label as the boundary puts every June row
+            # (dated the 1st to the 29th) in the "before" side — the split lands
+            # a month late and the measured effect is diluted by a month of
+            # normal trading.
+            monthly = tmp.set_index(date_col)[metric].resample("MS").sum().sort_index()
+            detected, split_strength = find_change_point(monthly)
+            if detected is not None and split_strength >= 0.25:
+                cutoff = pd.Timestamp(detected)
+                split_method = "detected"
+            else:
+                # No step worth calling a change point. Fall back to the old
+                # behaviour, but record that it is a fallback so the report can
+                # say the split was chosen, not found.
+                cutoff = tmp[date_col].quantile(0.67)
+                split_method = "fallback"
+
         previous = tmp[tmp[date_col] < cutoff]
         current = tmp[tmp[date_col] >= cutoff]
         if previous.empty or current.empty:
@@ -167,6 +188,9 @@ def run_dataframe_op(df: pd.DataFrame, operation: str, params: dict) -> dict:
             "by": by,
             "metric": metric,
             "split_date": str(cutoff.date()),
+            "split_method": split_method,
+            "split_strength": (round(split_strength, 3)
+                               if split_strength is not None else None),
             "direction": direction,
             "total_change_per_period": round(total_change, 2),
             "total_change_pct": round(total_change / prev.sum() * 100, 2) if prev.sum() else None,
@@ -224,10 +248,14 @@ def run_dataframe_op(df: pd.DataFrame, operation: str, params: dict) -> dict:
         n_values = len(inner["result"])
         even = 100.0 / n_values if n_values else 100.0
 
-        # Concentrated means one value carries far more than an even split, and
-        # there was more than one value to begin with.
+        # Concentrated means one value carries nearly all of it, not merely
+        # more than its share. At 67% across four regions the movement is
+        # spread across several of them, and narrowing the answer to one would
+        # point the reader at part of the problem while implying it is the
+        # whole. The bar is set where the narrower statement is clearly the
+        # better one to act on.
         concentrated = bool(top_inner and n_values > 1
-                            and inner_share > max(60.0, even * 1.8))
+                            and inner_share > max(80.0, even * 2.5))
 
         return {
             "operation": "interaction_contribution",
@@ -254,6 +282,70 @@ def run_dataframe_op(df: pd.DataFrame, operation: str, params: dict) -> dict:
     raise ValueError(f"Unhandled operation: {operation}")
 
 
+def find_change_point(series) -> tuple:
+    """Find where a series changed level, rather than assuming.
+
+    The comparison period was previously fixed at the most recent third of the
+    date range. That is a guess, and a bad one: if revenue fell in November but
+    the split lands in August, three normal months are averaged into the "after"
+    period and the fall looks smaller than it was. Move the split the other way
+    and it looks larger. Either way the headline figure is an artefact of where
+    the line was drawn.
+
+    This scans every candidate split and picks the one that best separates the
+    series into two levels — the point that minimises the total squared error
+    around each side's mean. It is a single change point by binary segmentation:
+    simple, deterministic, and explainable in a sentence, which matters more
+    here than sophistication nobody can check.
+
+    Returns (timestamp, strength) where strength is the share of variance the
+    split explains. A weak split means the series has no step in it, and the
+    caller should say so rather than dress a gentle drift as an event.
+    """
+    import numpy as np
+
+    values = series.to_numpy(dtype=float)
+    n = len(values)
+    if n < 8:
+        return None, 0.0
+
+    total_var = float(((values - values.mean()) ** 2).sum())
+    if total_var <= 0:
+        return None, 0.0
+
+    # Two points is the least that can have a mean and a spread. A larger
+    # margin looks safer but silently excludes real change points near the end
+    # of a series — and a recent change is the one most worth finding. The
+    # strength threshold and the straight-line check below are what reject
+    # noise; the margin only guarantees each side is measurable.
+    margin = 2
+    best_cost, best_i = None, None
+    for i in range(margin, n - margin):
+        left, right = values[:i], values[i:]
+        cost = (((left - left.mean()) ** 2).sum()
+                + ((right - right.mean()) ** 2).sum())
+        if best_cost is None or cost < best_cost:
+            best_cost, best_i = cost, i
+
+    if best_i is None:
+        return None, 0.0
+    strength = 1.0 - (best_cost / total_var)
+
+    # A steady decline has no step in it, but cutting it in half still explains
+    # most of its variance — two means beat one mean on any sloping line. Left
+    # unchecked, the detector reports a "change point" in the middle of a smooth
+    # trend and the report then claims something happened on a date when
+    # nothing did. So the step model is compared against a straight line: if a
+    # line fits about as well, this is a trend and there is no event to date.
+    x = np.arange(n, dtype=float)
+    slope, intercept = np.polyfit(x, values, 1)
+    line_cost = float(((values - (slope * x + intercept)) ** 2).sum())
+    if line_cost <= best_cost * 1.25:
+        return None, 0.0
+
+    return series.index[best_i], float(max(0.0, strength))
+
+
 def _seasonal_check(tmp, date_col: str, metric: str, by: str,
                     cutoff, top_group) -> dict:
     """Does the change survive a like-for-like comparison with a year earlier?
@@ -274,7 +366,7 @@ def _seasonal_check(tmp, date_col: str, metric: str, by: str,
         return {"checked": False, "reason": "group not found"}
 
     monthly = (series.set_index(date_col)[metric]
-               .resample("ME").sum().sort_index())
+               .resample("MS").sum().sort_index())
     if len(monthly) < 24:
         return {
             "checked": False,

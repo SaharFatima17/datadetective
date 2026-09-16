@@ -260,9 +260,19 @@ def _run_investigation(db: Session, investigation: Investigation,
     # measurements, and within each group the more confident result first.
     _type_rank = {"driver": 0, "association": 1, "measurement": 2}
     _conf_rank = {"high": 0, "medium": 1, "low": 2}
-    verified.sort(key=lambda f: (_type_rank.get(f.finding_type, 3),
-                                 _conf_rank.get(f.confidence, 3),
-                                 -abs(f.magnitude or 0)))
+
+    def _rank(f):
+        # A refined finding names a cell — "Widget, and within it the North
+        # region" — rather than one column. It is strictly more precise than
+        # either parent, so it leads. This matters when two columns are nearly
+        # tied: whichever wins by a point is close to arbitrary, while the cell
+        # they share is the actual answer.
+        refined = 0 if (f.evidence_summary or "").startswith(
+            "interaction_contribution") else 1
+        return (_type_rank.get(f.finding_type, 3), refined,
+                _conf_rank.get(f.confidence, 3), -abs(f.magnitude or 0))
+
+    verified.sort(key=_rank)
 
     # --- chart for the leading driver --------------------------------- #
     # A driver finding says one group carries the movement. A reader checks

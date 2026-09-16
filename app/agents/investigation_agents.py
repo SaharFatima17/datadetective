@@ -356,6 +356,7 @@ def test_hypothesis(
                             f"({result['total_change_pct']}%)."
                             + (f" Welch t-test p={stat['p_value']:.4g}, "
                                f"Cohen's d={stat['cohens_d']}." if stat else "")
+                            + _split_sentence(result)
                             + _season_sentence(result.get("seasonality"))
                             + _interval_sentence(top.get("contribution_ci"))
                         ),
@@ -604,6 +605,29 @@ def _refine_driver(db, investigation, plan: dict, metric: str, primary: str,
             "had it been spread evenly, the broader statement would stand alone."
         ),
     ))
+
+
+def _split_sentence(result: dict) -> str:
+    """Say how the comparison period was chosen.
+
+    A contribution figure depends entirely on where the line between "before"
+    and "after" is drawn. Reporting the number without saying how that date was
+    picked invites the reader to assume it was found in the data when, before
+    change-point detection, it was simply the most recent third.
+    """
+    method = result.get("split_method")
+    date = result.get("split_date")
+    if method == "detected":
+        return (f" The split at {date} is where the series changes level, found "
+                f"by scanning every candidate date (explains "
+                f"{result.get('split_strength')} of the variance).")
+    if method == "fallback":
+        return (f" No clear change point was found, so the split at {date} is "
+                "the most recent third of the range rather than a detected "
+                "event. Treat the date as arbitrary.")
+    if method == "supplied":
+        return f" The split at {date} was supplied rather than detected."
+    return ""
 
 
 def _season_sentence(seasonality: dict | None) -> str:

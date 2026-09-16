@@ -47,6 +47,7 @@ def scenario_regional_decline() -> tuple[pd.DataFrame, dict]:
                 })
     return pd.DataFrame(rows), {
         "scenario": "regional_decline",
+        "change_date": "2024-07-01",
         "true_cause": "Revenue decline is concentrated in region South",
         "true_driver_column": "region",
         "true_driver_value": "South",
@@ -74,6 +75,7 @@ def scenario_stock_shortage() -> tuple[pd.DataFrame, dict]:
             })
     return pd.DataFrame(rows), {
         "scenario": "stock_shortage",
+        "change_date": "2024-06-01",
         "true_cause": "in_stock_rate correlates with revenue; Beta availability fell",
         "true_driver_column": "in_stock_rate",
         "true_driver_value": "Beta",
@@ -102,6 +104,7 @@ def scenario_price_increase() -> tuple[pd.DataFrame, dict]:
             })
     return pd.DataFrame(rows), {
         "scenario": "price_increase",
+        "change_date": "2024-07-01",
         "true_cause": "price is inversely related to units, reducing revenue",
         "true_driver_column": "price",
         "true_driver_value": None,
@@ -123,6 +126,7 @@ def scenario_missing_evidence() -> tuple[pd.DataFrame, dict]:
             })
     return pd.DataFrame(rows), {
         "scenario": "missing_evidence",
+        "change_date": "2024-09-01",
         "true_cause": "Not determinable from this dataset - an external factor",
         "true_driver_column": None,
         "true_driver_value": None,
@@ -179,6 +183,7 @@ def scenario_multi_source() -> tuple[pd.DataFrame, dict]:
 
     return pd.DataFrame(rows), {
         "scenario": "multi_source",
+        "change_date": "2024-04-01",
         "true_cause": (
             "Widget revenue in the North region fell because a warehouse cooling "
             "failure cut Widget stock availability"
@@ -220,6 +225,7 @@ def scenario_changed_driver() -> tuple[pd.DataFrame, dict]:
 
     return pd.DataFrame(rows), {
         "scenario": "changed_driver",
+        "change_date": "2024-09-01",
         "true_cause": "The current decline is driven by product Y, not by region A as before",
         "true_driver_column": "product",
         "true_driver_value": "Y",
@@ -326,9 +332,14 @@ def compute_true_magnitude(df: pd.DataFrame, meta: dict) -> float | None:
     """The per-period change for the injected driver group (proposal Sec.20).
 
     Written independently of app/services so it is a genuine check on the
-    system's arithmetic rather than a restatement of it. The period split uses
-    the same definition the system uses - the most recent third of the date
-    range - because otherwise the two would be measuring different things.
+    system's arithmetic rather than a restatement of it.
+
+    The split is the date this scenario actually injected the change, which the
+    generator knows because it put it there. Earlier this mirrored the system's
+    own heuristic - the most recent third of the range - which meant the check
+    moved whenever that heuristic moved, and measured agreement with a guess
+    rather than agreement with the truth. Anchoring it to the injected date
+    makes the comparison independent of how the system chooses its split.
     """
     # some scenarios name the mechanism in true_driver_column (e.g. in_stock_rate)
     # while the segment the system reports on is a different column
@@ -353,7 +364,9 @@ def compute_true_magnitude(df: pd.DataFrame, meta: dict) -> float | None:
         frame = frame[frame["date"] <= pd.Timestamp(scope["end"])]
     if frame.empty:
         return None
-    cutoff = frame["date"].quantile(0.67)
+    change_date = meta.get("change_date")
+    cutoff = (pd.Timestamp(change_date) if change_date
+              else frame["date"].quantile(0.67))
     previous = frame[frame["date"] < cutoff]
     current = frame[frame["date"] >= cutoff]
     if previous.empty or current.empty:

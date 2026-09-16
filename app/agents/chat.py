@@ -42,7 +42,7 @@ from app.models import (
 # ---------------------------------------------------------------- intents #
 INTENTS = ("greeting", "need_data", "investigate", "drill_down", "answer_request",
            "report", "explain", "about_system", "data_question", "capabilities",
-           "acknowledge", "unclear")
+           "acknowledge", "unresolved", "unclear")
 
 GREETING = re.compile(r"^\s*(hi|hello|hey|salam|assalam|aoa|good (morning|evening|afternoon))\b", re.I)
 THANKS = re.compile(r"\b(thanks|thank you|thx|ok|okay|got it|great|perfect|shukriya|theek)\b", re.I)
@@ -117,6 +117,10 @@ def classify(text: str, *, has_dataset: bool, awaiting: bool, has_report: bool,
         return "acknowledge"
     if any(w in lowered for w in CAPABILITY_WORDS):
         return "capabilities"
+    if any(w in lowered for w in ("not establish", "could not test", "unresolved",
+                                  "what did you miss", "what is missing",
+                                  "rejected", "what could you not")):
+        return "unresolved" if has_report else "unclear"
     if _glossary_hit(lowered):
         return "about_system"
     if ASKS_MEANING.search(lowered) or any(w in lowered for w in EXPLAIN_WORDS):
@@ -312,7 +316,12 @@ PLACEHOLDER_TITLES = {"New conversation", "Greeting"}
 
 
 def maybe_name(db: Session, conversation: Conversation, text: str) -> None:
-    """Name the thread from the first message, improving it on the first question."""
+    """Name the thread from the first message, improving it on the first question.
+
+    A thread opened from a report is already named after that investigation, so
+    it is left alone — the name describes what the conversation is about, which
+    is the point.
+    """
     provisional = PLACEHOLDER_TITLES | {_provisional_title(db, conversation)}
     if conversation.title not in provisional:
         return
@@ -376,6 +385,8 @@ def respond(db: Session, conversation: Conversation, text: str) -> list[Message]
         return _resume(db, conversation, investigation, pending, text)
     if intent == "report":
         return _deliver_report(db, conversation, report)
+    if intent == "unresolved":
+        return [_unresolved(db, conversation, report)]
     if intent == "explain":
         return [_explain(db, conversation, investigation)]
     if intent == "data_question":
@@ -399,6 +410,44 @@ def _next_steps(db: Session, conversation: Conversation, report) -> dict:
         return _suggest("Why did revenue decline?", "What's in this data?")
     return _suggest("Explain that in simple words", "Write the report",
                     "Break it down by another column")
+
+
+def opening_for_investigation(db: Session, investigation) -> str:
+    """The first message when a thread is opened from a finished report.
+
+    Someone reading this did not run the investigation — they were handed the
+    result. So the opening states what was found and, just as importantly, what
+    the finding does not claim, before they ask anything.
+    """
+    driver = _driver_finding(db, investigation.id)
+    report = _latest_report(db, investigation.id)
+
+    lines = [f'This is about the investigation "{investigation.question}".']
+
+    if driver:
+        lines.append(driver.statement)
+        lines.append(
+            "That is the explanation: the change is concentrated there rather "
+            "than spread evenly. Every figure in it came from a calculation you "
+            "can make me run again."
+        )
+    else:
+        lines.append(
+            "No single cause was established. The change was measured, but "
+            "nothing in the data accounted for it, so none was named."
+        )
+
+    unresolved = ((report.content or {}).get("unresolved_hypotheses")
+                  if report else None)
+    if unresolved:
+        lines.append(
+            f"{len(unresolved)} possible explanation"
+            f"{'s' if len(unresolved) != 1 else ''} could not be tested with the "
+            "data available. Ask what they were if that matters."
+        )
+
+    lines.append("What would you like me to go through?")
+    return "\n\n".join(lines)
 
 
 def _acknowledge(db, conversation, report):
@@ -534,6 +583,30 @@ def _drill(db: Session, conversation: Conversation, text: str,
                          "breakdown": result, "tool_run_id": str(run.id),
                          **_suggest("Write the report",
                                     "Explain that in simple words")})
+
+
+def _unresolved(db, conversation, report):
+    """What the investigation could not settle.
+
+    Reported as plainly as the findings. An answer that hides its gaps is the
+    kind of answer this system exists to avoid.
+    """
+    content = (report.content or {}) if report else {}
+    unresolved = content.get("unresolved_hypotheses") or []
+    if not unresolved:
+        return _say(db, conversation,
+                    "Every hypothesis raised was either supported or rejected by "
+                    "the data — none was left unresolved.",
+                    _suggest("Explain that in simple words", "Write the report"))
+
+    lines = ["These were raised and could not be settled with the data available:"]
+    lines.extend(f"- {h}" for h in unresolved)
+    lines.append(
+        "They are listed rather than dropped, so the answer's limits are visible. "
+        "Supplying data that covers them would let me test them."
+    )
+    return _say(db, conversation, "\n\n".join(lines),
+                _suggest("Explain that in simple words", "Write the report"))
 
 
 def _unclear(db, conversation, report, columns):

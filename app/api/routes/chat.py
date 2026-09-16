@@ -28,6 +28,18 @@ def _serialise(message: Message) -> dict:
     }
 
 
+def _authorize_investigation(db: Session, investigation_id: uuid.UUID, user: User):
+    from app.models import Investigation
+
+    investigation = db.get(Investigation, investigation_id)
+    if not investigation:
+        raise HTTPException(404, "No such investigation")
+    if (investigation.owner_id and investigation.owner_id != user.id
+            and user.role != "admin"):
+        raise HTTPException(403, "That investigation belongs to another user")
+    return investigation
+
+
 def _conversation(db: Session, conversation_id: uuid.UUID, user: User) -> Conversation:
     conversation = db.get(Conversation, conversation_id)
     if not conversation:
@@ -43,21 +55,43 @@ def create_conversation(payload: ConversationCreate,
                         user: User = Depends(require_role("admin", "analyst")),
                         db: Session = Depends(get_db)):
     dataset_id = None
-    if payload.dataset_id:
+    investigation = None
+
+    if payload.investigation_id:
+        # Opened from a report. The thread inherits both the investigation and
+        # the dataset it ran on, so follow-up questions land on the same work
+        # rather than starting a new one.
+        investigation = _authorize_investigation(
+            db, uuid.UUID(payload.investigation_id), user)
+        dataset_id = investigation.dataset_id
+    elif payload.dataset_id:
         dataset_id = authorize_dataset(db, uuid.UUID(payload.dataset_id), user).id
 
     conversation = Conversation(
         owner_id=user.id,
         title=payload.title or "New conversation",
         dataset_id=dataset_id,
+        investigation_id=investigation.id if investigation else None,
     )
     db.add(conversation)
     db.flush()
 
-    chat_agent.add_message(
-        db, conversation, "assistant",
-        chat_agent._greeting(db, conversation),
-    )
+    if investigation:
+        conversation.title = chat_agent.title_for(investigation.question)
+        chat_agent.add_message(
+            db, conversation, "assistant",
+            chat_agent.opening_for_investigation(db, investigation),
+            kind="text",
+            payload=chat_agent._suggest(
+                "Explain that in simple words",
+                "How do you know?",
+                "What could you not establish?"),
+        )
+    else:
+        chat_agent.add_message(
+            db, conversation, "assistant",
+            chat_agent._greeting(db, conversation),
+        )
     db.commit()
     return {"id": str(conversation.id), "title": conversation.title,
             "messages": [_serialise(m) for m in conversation.messages]}

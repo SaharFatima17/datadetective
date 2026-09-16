@@ -108,6 +108,9 @@ class ResumeRequest(BaseModel):
 class ConversationCreate(BaseModel):
     title: str | None = None
     dataset_id: str | None = None
+    # Start a thread already attached to a finished investigation, so someone
+    # who has been handed a report can ask about it without re-running anything.
+    investigation_id: str | None = None
 
 
 class ChatMessageRequest(BaseModel):
