@@ -3,22 +3,25 @@ from __future__ import annotations
 import uuid
 from pathlib import Path
 
+import shutil
+
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.core.deps import authorize_dataset, get_current_user, require_role
 from app.database import get_db
-from app.models import DataSource, Dataset, DatasetVersion, User
+from app.models import DataSource, Dataset, DatasetVersion, Document, User
 from app.models import DatasetColumn
 from app.schemas.requests import (
+    CrawlRequest,
     CleaningApplyRequest,
     ColumnSensitivityUpdate,
     DatasetUpdate,
     SQLIngestRequest,
     URLIngestRequest,
 )
-from app.services import cleaning, dataquality, ingestion, profiling, rag
+from app.services import crawler, cleaning, dataquality, ingestion, profiling, rag
 
 router = APIRouter(prefix="/api", tags=["data"])
 
@@ -99,6 +102,26 @@ def ingest_sql(payload: SQLIngestRequest,
     return {"dataset_id": str(dataset.id), "version_id": str(version.id), "profile": summary}
 
 
+@router.post("/sources/crawl")
+def crawl(payload: CrawlRequest,
+          user: User = Depends(require_role("admin", "analyst")),
+          db: Session = Depends(get_db)):
+    """Index a whole site, not just one address (proposal Sec.5).
+
+    A single page is rarely what someone means when they say "the system should
+    know about this company". The information is spread across several pages and
+    the documents linked from them, and a question about the company is answered
+    by whichever of those happens to hold the answer.
+    """
+    try:
+        return crawler.crawl_site(db, payload.url, owner_id=user.id,
+                                  max_pages=payload.max_pages,
+                                  max_depth=payload.max_depth)
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(400, str(exc)) from exc
+
+
 @router.post("/sources/url")
 def ingest_url(payload: URLIngestRequest,
                user: User = Depends(require_role("admin", "analyst")),
@@ -140,6 +163,44 @@ def list_sources(user: User = Depends(get_current_user), db: Session = Depends(g
 
 
 # ===================== datasets ====================================== #
+@router.delete("/sources/{source_id}")
+def delete_source(source_id: uuid.UUID,
+                  user: User = Depends(require_role("admin", "analyst")),
+                  db: Session = Depends(get_db)):
+    """Remove a registered source, its snapshot and anything indexed from it.
+
+    A source is refused while a dataset still points at it. The dataset's
+    versions are derived from that file, and deleting the original would leave
+    an investigation citing a source that no longer exists — which breaks the
+    one guarantee the whole system rests on.
+    """
+    source = db.get(DataSource, source_id)
+    if not source:
+        raise HTTPException(404, "No such source")
+    if source.owner_id and source.owner_id != user.id and user.role != "admin":
+        raise HTTPException(403, "That source belongs to another user")
+
+    dataset = db.query(Dataset).filter(Dataset.source_id == source.id).first()
+    if dataset:
+        raise HTTPException(
+            409,
+            f"'{dataset.name}' was built from this source. Delete the dataset "
+            "first, or keep the source so its findings stay traceable.",
+        )
+
+    name = source.name
+    removed_docs = 0
+    for doc in db.query(Document).filter(Document.source_id == source.id).all():
+        db.delete(doc)
+        removed_docs += 1
+
+    shutil.rmtree(Path(settings.STORAGE_DIR) / "sources" / str(source.id),
+                  ignore_errors=True)
+    db.delete(source)
+    db.commit()
+    return {"deleted": True, "name": name, "documents_removed": removed_docs}
+
+
 @router.get("/datasets")
 def list_datasets(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     query = db.query(Dataset).filter(Dataset.is_deleted.is_(False))

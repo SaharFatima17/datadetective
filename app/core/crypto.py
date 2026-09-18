@@ -32,7 +32,7 @@ MARKER = b"DDENC1:"
 class EncryptionError(RuntimeError):
     pass
 
-
+#use Fernet symmetric encryption to encrypt and decrypt data at rest, with a marker to indicate encrypted files.
 def _fernet():
     from cryptography.fernet import Fernet
 
@@ -51,7 +51,7 @@ def _fernet():
         derived = base64.urlsafe_b64encode(hashlib.sha256(key.encode()).digest())
         return Fernet(derived)
 
-
+#store the given data in a file at the given path
 def enabled() -> bool:
     return bool(settings.ENCRYPT_AT_REST)
 

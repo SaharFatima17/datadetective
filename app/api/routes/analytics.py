@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.core.deps import authorize_dataset, get_current_user, require_role
 from app.database import get_db
-from app.models import Chart, Document, ToolRun, User
+from app.models import Brief, Chart, Document, ToolRun, User
 from app.schemas.requests import (
     AnalyzeRequest,
     ChartRequest,
@@ -168,6 +168,116 @@ def search(payload: SearchRequest, user: User = Depends(get_current_user),
                 db, payload.query, top_k=payload.top_k,
                 document_type=payload.document_type,
                 owner_id=None if user.role == "admin" else user.id)}
+
+
+@router.post("/ask")
+def ask_documents(payload: SearchRequest, user: User = Depends(get_current_user),
+                  db: Session = Depends(get_db)):
+    """Answer a question from the knowledge base alone — no dataset required.
+
+    Some questions are not about a metric at all. "What does this company do?"
+    is answered by the pages that were indexed, not by a statistical test, and
+    demanding a spreadsheet first would make the knowledge base decorative.
+    """
+    return rag.answer_from_documents(
+        db, payload.query, top_k=payload.top_k or 6,
+        owner_id=None if user.role == "admin" else user.id)
+
+
+@router.post("/brief")
+def brief(payload: SearchRequest,
+          user: User = Depends(require_role("admin", "analyst")),
+          db: Session = Depends(get_db)):
+    """Compose a cited brief from the knowledge base, and keep it.
+
+    Deliberately not filed under Reports: that page promises a report for every
+    completed investigation, and a document brief is a different claim. Mixing
+    them would blur the one distinction this system exists to hold.
+
+    The result is stored as written. Reopening it later shows what it said when
+    it was made, not what the same question would return today after documents
+    have been added or removed — otherwise a brief someone acted on could
+    quietly change underneath them.
+    """
+    result = rag.compose_brief(
+        db, payload.query, top_k=payload.top_k or 14,
+        owner_id=None if user.role == "admin" else user.id)
+    if not result.get("available"):
+        return result
+
+    row = Brief(
+        owner_id=user.id,
+        topic=result["topic"][:500],
+        title=result["title"][:500],
+        summary=result.get("summary"),
+        sections=result.get("sections"),
+        sources=result.get("sources"),
+        composed=bool(result.get("composed")),
+        basis=result.get("basis"),
+    )
+    db.add(row)
+    db.commit()
+    return {**result, "id": str(row.id), "created_at": row.created_at}
+
+
+def _brief_payload(row: Brief) -> dict:
+    return {
+        "available": True,
+        "id": str(row.id),
+        "topic": row.topic,
+        "title": row.title,
+        "summary": row.summary,
+        "sections": row.sections or [],
+        "sources": row.sources or [],
+        "composed": row.composed,
+        "basis": row.basis,
+        "created_at": row.created_at,
+    }
+
+
+@router.get("/briefs")
+def list_briefs(user: User = Depends(get_current_user),
+                db: Session = Depends(get_db)):
+    query = db.query(Brief)
+    if user.role != "admin":
+        query = query.filter(Brief.owner_id == user.id)
+    rows = query.order_by(Brief.created_at.desc()).all()
+    return {
+        "count": len(rows),
+        "briefs": [
+            {"id": str(r.id), "title": r.title, "topic": r.topic,
+             "summary": (r.summary or "")[:280], "composed": r.composed,
+             "sections": len(r.sections or []), "sources": len(r.sources or []),
+             "created_at": r.created_at}
+            for r in rows
+        ],
+    }
+
+
+def _own_brief(db: Session, brief_id: uuid.UUID, user: User) -> Brief:
+    row = db.get(Brief, brief_id)
+    if not row:
+        raise HTTPException(404, "No such brief")
+    if row.owner_id and row.owner_id != user.id and user.role != "admin":
+        raise HTTPException(403, "That brief belongs to another user")
+    return row
+
+
+@router.get("/briefs/{brief_id}")
+def get_brief(brief_id: uuid.UUID, user: User = Depends(get_current_user),
+              db: Session = Depends(get_db)):
+    return _brief_payload(_own_brief(db, brief_id, user))
+
+
+@router.delete("/briefs/{brief_id}")
+def delete_brief(brief_id: uuid.UUID,
+                 user: User = Depends(require_role("admin", "analyst")),
+                 db: Session = Depends(get_db)):
+    row = _own_brief(db, brief_id, user)
+    title = row.title
+    db.delete(row)
+    db.commit()
+    return {"deleted": True, "title": title}
 
 
 @router.get("/definitions/{term}")

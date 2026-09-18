@@ -15,6 +15,7 @@ import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 import pandas as pd
 from sqlalchemy.orm import Session
@@ -354,6 +355,70 @@ def ingest_from_sql(
 # --------------------------------------------------------------------- #
 # Document / URL extraction (proposal Sec.7 step 3)
 # --------------------------------------------------------------------- #
+def register_url_source(db: Session, url: str, content: bytes,
+                        content_type: str = "text/html",
+                        owner_id: uuid.UUID | None = None) -> DataSource:
+    """Store one retrieved address with its snapshot and checksum.
+
+    Split out of `fetch_url` so the crawler can register many pages without
+    re-implementing provenance. Every page keeps the same guarantee a single
+    fetch does: what was read is on disk, fingerprinted, and still there if the
+    live page changes.
+    """
+    suffix = _suffix_for(url, content_type)
+    source = DataSource(
+        owner_id=owner_id,
+        name=url,
+        source_type="url",
+        source_format=suffix.lstrip(".") or "html",
+        origin_uri=url,
+        checksum_sha256=sha256_bytes(content),
+        size_bytes=len(content),
+        retrieved_at=datetime.now(timezone.utc),
+        status="registered",
+        source_metadata={"content_type": content_type, "final_url": url},
+    )
+    db.add(source)
+    db.flush()
+
+    path = storage_path("sources", str(source.id), f"original{suffix}")
+    crypto.write_bytes(path, content)
+    db.add(SourceArtifact(source_id=source.id, artifact_type="snapshot",
+                          storage_path=str(path), size_bytes=len(content),
+                          mime_type=content_type,
+                          checksum_sha256=source.checksum_sha256))
+    db.flush()
+    return source
+
+
+def _suffix_for(url: str, content_type: str) -> str:
+    """Pick a file extension so the extractor knows how to read the bytes."""
+    lowered = (content_type or "").lower()
+    for marker, suffix in (("pdf", ".pdf"), ("wordprocessingml", ".docx"),
+                           ("presentationml", ".pptx"), ("csv", ".csv"),
+                           ("plain", ".txt")):
+        if marker in lowered:
+            return suffix
+    path_suffix = Path(urlparse(url).path).suffix.lower()
+    if path_suffix in DOCUMENT_EXTS or path_suffix == ".csv":
+        return path_suffix
+    return ".html"
+
+
+def extract_text_from_bytes(content: bytes, content_type: str, url: str) -> str:
+    """Read text out of retrieved bytes without keeping a second copy on disk."""
+    import tempfile
+
+    suffix = _suffix_for(url, content_type)
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(content)
+        tmp_path = Path(tmp.name)
+    try:
+        return _extract_text(tmp_path, suffix)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
 def extract_text(path: Path) -> str:
     """Extract text from a stored document, decrypting first if necessary."""
     ext = Path(path).suffix.lower()

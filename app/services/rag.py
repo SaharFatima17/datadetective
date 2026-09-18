@@ -17,6 +17,7 @@ import uuid
 
 from sqlalchemy.orm import Session
 
+from app.llm.client import llm
 from app.llm.embeddings import cosine_similarity, embedder
 from app.models import (
     Document,
@@ -153,6 +154,9 @@ def search(
                     "chunk_index": chunk.chunk_index,
                     "content": chunk.content,
                     "score": round(score, 4),
+                    # the page address, when the document came from the web —
+                    # a citation the reader can actually open
+                    "url": (doc.document_metadata or {}).get("url"),
                 }
             )
 
@@ -236,6 +240,161 @@ def past_feedback_for_driver(db: Session, driver_text: str,
 # whatever chunk happened to rank first, and the report then claims it consulted
 # a definition of "recently".
 MIN_DEFINITION_SCORE = 0.35
+
+
+ANSWER_SYSTEM = (
+    "Answer the question using only the passages provided. Every claim must be "
+    "supported by them. If they do not contain the answer, say so plainly "
+    "instead of filling the gap. Cite sources as [1], [2] matching the numbered "
+    "passages. Be brief: three or four sentences."
+)
+
+
+def answer_from_documents(db: Session, question: str, top_k: int = 6,
+                          owner_id=None) -> dict:
+    """Answer a question from indexed documents, with citations (Sec.14).
+
+    This is the document counterpart to an investigation, and it is deliberately
+    weaker in what it claims. An investigation computes a number and can re-run
+    the calculation to prove it; a document answer can only point at the passage
+    it came from. So the passages are returned alongside the answer and the
+    answer is never presented as a measurement.
+
+    Without a configured model the passages are returned as they are. That is an
+    honest degradation: quoting the source is a worse reading experience than a
+    written answer, but it is never a fabricated one.
+    """
+    hits = search(db, question, top_k=top_k, owner_id=owner_id, min_score=0.05)
+    if not hits:
+        return {
+            "answered": False,
+            "answer": ("Nothing in the indexed documents addresses that. Add a "
+                       "page or document that covers it and ask again."),
+            "sources": [],
+        }
+
+    numbered = "\n\n".join(
+        f"[{i + 1}] from \"{h['document_title']}\":\n{h['content'][:1200]}"
+        for i, h in enumerate(hits)
+    )
+
+    answer, grounded = None, True
+    try:
+        raw = llm.complete(system=ANSWER_SYSTEM,
+                           prompt=f"Question: {question}\n\nPassages:\n{numbered}")
+        text = (raw or "").strip()
+        if text and not text.startswith("["):
+            answer = text
+    except Exception:  # noqa: BLE001
+        answer = None
+
+    if answer is None:
+        grounded = False
+        answer = (
+            "No language model is configured, so here are the passages that "
+            "match most closely, in order. They are quoted as indexed, not "
+            "summarised."
+        )
+
+    return {
+        "answered": True,
+        "answer": answer,
+        "composed": grounded,
+        "sources": [
+            {"n": i + 1, "title": h["document_title"], "score": h["score"],
+             "excerpt": h["content"][:400], "type": h["document_type"]}
+            for i, h in enumerate(hits)
+        ],
+        "note": ("Sourced from indexed documents. Unlike an investigation "
+                 "finding, this is not a computed figure — it can be traced to "
+                 "the passage it came from, not re-calculated."),
+    }
+
+
+BRIEF_SYSTEM = (
+    "You write a short factual brief from supplied passages. Return JSON only:\n"
+    '{"title": "...", "summary": "...", '
+    '"sections": [{"heading": "...", "body": "...", "cites": [1, 2]}]}\n'
+    "Rules: every sentence must come from the passages. Cite the numbered "
+    "passages you used in `cites`. Four to six sections. If the passages do not "
+    "cover something, leave it out rather than filling it in. Do not invent "
+    "figures, dates, names or claims."
+)
+
+
+def compose_brief(db: Session, topic: str, top_k: int = 14,
+                  owner_id=None) -> dict:
+    """Assemble a brief on a topic from indexed documents (proposal Sec.14).
+
+    This is not an investigation report and must never be mistaken for one. An
+    investigation computes figures and can re-run the calculation that produced
+    each of them; a brief can only point at the passage a statement came from.
+    The two are different kinds of claim, so this returns its own shape, carries
+    its own wording, and is never filed under Reports.
+
+    Without a configured model the sections are the retrieved passages grouped
+    by the page they came from. That is a worse read than composed prose and a
+    truthful one: nothing is asserted that was not retrieved.
+    """
+    hits = search(db, topic, top_k=top_k, owner_id=owner_id, min_score=0.05)
+    if not hits:
+        return {"available": False,
+                "reason": "Nothing indexed covers that topic."}
+
+    numbered = "\n\n".join(
+        f"[{i + 1}] from \"{h['document_title']}\":\n{h['content'][:1500]}"
+        for i, h in enumerate(hits)
+    )
+
+    composed, data = True, None
+    try:
+        result = llm.complete_json(
+            system=BRIEF_SYSTEM,
+            prompt=f"Topic: {topic}\n\nPassages:\n{numbered}")
+        if isinstance(result, dict) and result.get("sections"):
+            data = result
+    except Exception:  # noqa: BLE001
+        data = None
+
+    if data is None:
+        composed = False
+        # Group what was retrieved by source rather than pretending to a
+        # narrative the model did not write.
+        by_source: dict[str, list[tuple[int, str]]] = {}
+        for i, h in enumerate(hits):
+            by_source.setdefault(h["document_title"], []).append((i + 1, h["content"]))
+        data = {
+            "title": topic,
+            "summary": ("No language model is configured, so this is the "
+                        "retrieved material grouped by source rather than a "
+                        "written brief. Nothing has been summarised or inferred."),
+            "sections": [
+                {"heading": title,
+                 "body": "\n\n".join(c[:600] for _, c in parts),
+                 "cites": [n for n, _ in parts]}
+                for title, parts in list(by_source.items())[:8]
+            ],
+        }
+
+    return {
+        "available": True,
+        "composed": composed,
+        "topic": topic,
+        "title": data.get("title") or topic,
+        "summary": data.get("summary", ""),
+        "sections": data.get("sections", []),
+        "sources": [
+            {"n": i + 1, "title": h["document_title"], "type": h["document_type"],
+             "score": h["score"], "excerpt": h["content"][:300],
+             "url": h.get("url")}
+            for i, h in enumerate(hits)
+        ],
+        "basis": (
+            "Sourced from indexed pages and documents. Unlike an investigation "
+            "report, nothing here is a computed figure: each statement traces to "
+            "the passage it came from, and cannot be re-calculated."
+        ),
+    }
 
 
 def get_business_definition(db: Session, term: str, owner_id=None) -> dict | None:

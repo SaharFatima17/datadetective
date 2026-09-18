@@ -14,6 +14,7 @@ from app.core.deps import (
 )
 from app.database import get_db
 from app.models import (
+    Document,
     InvestigationComparison,
     Feedback,
     Finding,
@@ -214,6 +215,36 @@ def get_report(investigation_id: uuid.UUID, user: User = Depends(get_current_use
         raise HTTPException(404, "No report yet for this investigation")
     return {"id": str(report.id), "version": report.version_number, "title": report.title,
             "executive_summary": report.executive_summary, **(report.content or {})}
+
+
+@router.delete("/{investigation_id}")
+def delete_investigation(investigation_id: uuid.UUID,
+                         user: User = Depends(require_role("admin", "analyst")),
+                         db: Session = Depends(get_db)):
+    """Remove an investigation and everything recorded under it.
+
+    Repeated questions during testing pile up, and a list of thirty runs of the
+    same question makes the real ones hard to find. Findings, hypotheses, tool
+    runs, forecasts, recommendations and reports all cascade from the
+    investigation, so removing it takes the whole record with it.
+
+    The report this investigation indexed into the knowledge base goes too:
+    leaving it behind would let a deleted run keep shaping future retrieval,
+    which is the same mistake the workspace-reset script had to fix.
+    """
+    investigation = _get(db, investigation_id, user)
+    question = investigation.question
+
+    removed_docs = 0
+    for doc in db.query(Document).filter(Document.document_type == "past_report").all():
+        if str((doc.document_metadata or {}).get("investigation_id")) == str(investigation.id):
+            db.delete(doc)
+            removed_docs += 1
+
+    db.delete(investigation)
+    db.commit()
+    return {"deleted": True, "question": question,
+            "indexed_reports_removed": removed_docs}
 
 
 @router.get("/{investigation_id}/comparison")

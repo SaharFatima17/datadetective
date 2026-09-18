@@ -113,6 +113,13 @@ class ConversationCreate(BaseModel):
     investigation_id: str | None = None
 
 
+class CrawlRequest(BaseModel):
+    url: str
+    # Kept small on purpose: a crawl nobody can review is a crawl nobody trusts.
+    max_pages: int = 15
+    max_depth: int = 2
+
+
 class ChatMessageRequest(BaseModel):
     content: str
 

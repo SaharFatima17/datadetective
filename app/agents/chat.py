@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 
 from app.agents import orchestrator
 from app.llm.client import llm
+from app.services import rag
 from app.tools import registry
 from app.models import (
     Conversation,
@@ -40,11 +41,27 @@ from app.models import (
 )
 
 # ---------------------------------------------------------------- intents #
-INTENTS = ("greeting", "need_data", "investigate", "drill_down", "answer_request",
-           "report", "explain", "about_system", "data_question", "capabilities",
-           "acknowledge", "unresolved", "unclear")
+INTENTS = ("greeting", "farewell", "off_topic", "need_data", "investigate",
+           "drill_down", "answer_request", "report", "explain", "about_system",
+           "data_question", "capabilities", "acknowledge", "unresolved",
+           "document_question", "unclear")
 
-GREETING = re.compile(r"^\s*(hi|hello|hey|salam|assalam|aoa|good (morning|evening|afternoon))\b", re.I)
+GREETING = re.compile(
+    r"^\s*(hi+|hello|hey|salam|assalam|assalamu|aoa|greetings"
+    r"|good (morning|evening|afternoon))\b", re.I)
+
+FAREWELL = re.compile(
+    r"^\s*(bye|goodbye|good night|khuda hafiz|allah hafiz|see you"
+    r"|that'?s all|thats all|done for now)\b", re.I)
+
+# Requests this assistant does not take. Listed explicitly so the refusal is the
+# same with or without a model behind it — a demo running offline should not
+# suddenly answer differently from one with a key.
+OFF_TOPIC = (
+    "joke", "poem", "story", "recipe", "song", "weather", "translate",
+    "write me a", "write a python", "write code", "who won", "your opinion",
+    "what do you think about", "capital of", "how old", "math problem",
+)
 THANKS = re.compile(r"\b(thanks|thank you|thx|ok|okay|got it|great|perfect|shukriya|theek)\b", re.I)
 # "what does 123% mean" / "what do those numbers mean" — the words between
 # "what does" and "mean" vary, so a keyword list cannot catch them all.
@@ -96,7 +113,7 @@ def _glossary_hit(text: str) -> str | None:
 
 
 def classify(text: str, *, has_dataset: bool, awaiting: bool, has_report: bool,
-             columns: list[str]) -> str:
+             columns: list[str], has_documents: bool = False) -> str:
     """Decide what the person is asking for.
 
     Order matters. An open request for data outranks everything, because the
@@ -111,8 +128,12 @@ def classify(text: str, *, has_dataset: bool, awaiting: bool, has_report: bool,
 
     if awaiting:
         return "answer_request"
+    if FAREWELL.match(lowered) and len(words) <= 5:
+        return "farewell"
     if GREETING.match(lowered) and len(words) <= 4:
         return "greeting"
+    if any(w in lowered for w in OFF_TOPIC):
+        return "off_topic"
     if THANKS.search(lowered) and len(words) <= 4:
         return "acknowledge"
     if any(w in lowered for w in CAPABILITY_WORDS):
@@ -132,7 +153,11 @@ def classify(text: str, *, has_dataset: bool, awaiting: bool, has_report: bool,
             return "report"
         return "investigate" if has_dataset else "need_data"
     if not has_dataset:
-        return "need_data"
+        # Without a spreadsheet there is still the knowledge base. A question
+        # about an indexed site or document is answerable from the documents
+        # themselves, and refusing it because no CSV is attached would make
+        # everything that was crawled unusable.
+        return "document_question" if has_documents else "need_data"
 
     mentioned = [c for c in columns if c.lower() in lowered]
     if mentioned and has_report and any(w in lowered for w in DRILL_WORDS):
@@ -364,12 +389,42 @@ def respond(db: Session, conversation: Conversation, text: str) -> list[Message]
     profile = _profile(db, conversation)
     columns = _columns(profile)
 
+    from app.models import Document
+
+    has_documents = db.query(Document.id).filter(
+        (Document.owner_id == conversation.owner_id)
+        | (Document.owner_id.is_(None))
+    ).first() is not None
+
     context = {"has_dataset": conversation.dataset_id is not None,
                "has_report": report is not None}
-    intent = classify(text, awaiting=pending is not None, columns=columns, **context)
+    intent = classify(text, awaiting=pending is not None, columns=columns,
+                      has_documents=has_documents, **context)
     if not pending:
         intent = refine_with_model(text, intent, context)
 
+    # Greetings, thanks, capability questions and anything unclassified are
+    # conversation rather than analysis. A model answers those in the person's
+    # own register; without one the fixed wording below still applies.
+    if intent in {"greeting", "farewell", "off_topic", "acknowledge",
+                  "capabilities", "unclear"}:
+        note = _state_note(db, conversation, report, has_documents)
+        spoken = converse(db, conversation, text, note)
+        if spoken:
+            return [_say(db, conversation, spoken,
+                         _next_steps(db, conversation, report))]
+
+    if intent == "farewell":
+        return [_say(db, conversation,
+                     "Goodbye. Your investigations and documents stay here for "
+                     "whenever you come back.")]
+    if intent == "off_topic":
+        return [_say(
+            db, conversation,
+            "That's outside what I do — I'm a data investigation agent. I can "
+            "look into why a number moved in your data, explain a finding, or "
+            "answer questions from the pages and documents you've indexed.",
+            _next_steps(db, conversation, report))]
     if intent == "greeting":
         return [_say(db, conversation, _greeting(db, conversation, opening=False),
                      _next_steps(db, conversation, report))]
@@ -385,6 +440,8 @@ def respond(db: Session, conversation: Conversation, text: str) -> list[Message]
         return _resume(db, conversation, investigation, pending, text)
     if intent == "report":
         return _deliver_report(db, conversation, report)
+    if intent == "document_question":
+        return [_answer_from_documents(db, conversation, text)]
     if intent == "unresolved":
         return [_unresolved(db, conversation, report)]
     if intent == "explain":
@@ -448,6 +505,115 @@ def opening_for_investigation(db: Session, investigation) -> str:
 
     lines.append("What would you like me to go through?")
     return "\n\n".join(lines)
+
+
+CONVERSE_SYSTEM = """You are DataDetective's assistant. You investigate business
+data. Talk like a capable colleague: warm, brief, plain English — two or three
+sentences unless more is genuinely needed.
+
+What this system does: someone attaches a spreadsheet and asks a question in
+ordinary language. Agents form hypotheses, test each one with pandas, SQL and
+statistical tests, verify every number by re-running the calculation that
+produced it, and report what could not be established. Documents and websites
+can also be indexed, and questions about those are answered from the passages
+themselves.
+
+YOU MUST NOT STATE A FIGURE about the person's data — no percentage, no trend,
+no finding. You have not seen their data and you cannot calculate. If they ask
+something answerable from their data, say you will look and let the analysis
+run. Inventing a number here would destroy the only thing this system is for.
+
+STAY ON YOUR SUBJECT. You are not a general assistant. Greetings, thanks and
+goodbyes get a natural reply. Everything else must concern data investigation,
+this system, or the documents that have been indexed.
+
+If someone asks for a joke, a poem, a recipe, general knowledge, coding help, or
+anything else outside data investigation, say plainly in one sentence that this
+is not what you do, and offer what you can: investigate a question about their
+data, explain a finding, or answer from the indexed documents. Do not apologise
+at length and do not comply partially — a joke told "just this once" teaches the
+person to expect a general chatbot, and then to trust its numbers too."""
+
+
+def converse(db: Session, conversation: Conversation, text: str,
+             context_note: str) -> str | None:
+    """Reply in the person's own register, when a model is configured.
+
+    The rule-based replies elsewhere are exact but fixed: the same sentence
+    every time, whatever was asked. For greetings, thanks, and anything that
+    does not map onto an analytical action, that reads like a switchboard. This
+    hands those turns to the model with the thread so far, and returns None when
+    no model is configured so the caller falls back to the fixed wording.
+
+    The model is given the state of the conversation but never the data, and is
+    told plainly that it must not produce figures. Everything numerical still
+    comes from the tool layer.
+    """
+    already_greeted = (
+        db.query(Message)
+        .filter(Message.conversation_id == conversation.id,
+                Message.role == "assistant")
+        .count()
+        > 0
+    )
+
+    history = (
+        db.query(Message)
+        .filter(Message.conversation_id == conversation.id)
+        .order_by(Message.created_at.desc())
+        .limit(8)
+        .all()
+    )
+    transcript = "\n".join(
+        f"{m.role}: {m.content[:400]}" for m in reversed(history)
+    )
+
+    try:
+        reply = llm.complete(
+            system=CONVERSE_SYSTEM,
+            prompt=(f"Current state: {context_note}\n\n"
+                    f"Conversation so far:\n{transcript}\n\n"
+                    + ("You have already greeted this person in this thread. Do "
+                       "not greet again — acknowledge briefly and move on to "
+                       "what they can do next.\n\n" if already_greeted else "")
+                    + "Reply to the last user message."),
+        )
+    except Exception:  # noqa: BLE001
+        return None
+
+    reply = (reply or "").strip()
+
+    # Anything that is not prose is not an answer. The offline stand-in returns
+    # a placeholder in brackets, and — because it matches on prompt keywords —
+    # can return a JSON analysis plan instead. Either one shown to the person
+    # would be the machinery leaking through the conversation, so both are
+    # rejected and the caller falls back to its fixed wording.
+    if (not reply
+            or len(reply) < 3
+            or reply[0] in "[{"
+            or reply.startswith("```")
+            or '"target_metric"' in reply
+            or "mock LLM" in reply):
+        return None
+    return reply
+
+
+def _state_note(db: Session, conversation: Conversation, report, has_documents: bool) -> str:
+    """One line describing what is loaded, so replies suggest the right next step."""
+    parts = []
+    if conversation.dataset_id:
+        dataset = db.get(Dataset, conversation.dataset_id)
+        parts.append(f"a spreadsheet is attached ({dataset.name if dataset else 'unknown'})")
+    else:
+        parts.append("no spreadsheet is attached")
+    if report:
+        driver = _driver_finding(db, conversation.investigation_id)
+        parts.append("an investigation has finished"
+                     + (f"; its explanation was: {driver.statement}" if driver else
+                        " and found no explanation"))
+    if has_documents:
+        parts.append("documents and pages are indexed and can be asked about")
+    return "; ".join(parts) + "."
 
 
 def _acknowledge(db, conversation, report):
@@ -583,6 +749,43 @@ def _drill(db: Session, conversation: Conversation, text: str,
                          "breakdown": result, "tool_run_id": str(run.id),
                          **_suggest("Write the report",
                                     "Explain that in simple words")})
+
+
+def _answer_from_documents(db: Session, conversation: Conversation, text: str):
+    """Answer from the knowledge base when there is no dataset in play.
+
+    The sources are listed with the answer, always. A document answer cannot be
+    re-computed the way a finding can, so the only thing that makes it checkable
+    is showing where each part came from.
+    """
+    result = rag.answer_from_documents(
+        db, text, top_k=5, owner_id=conversation.owner_id)
+
+    if not result["answered"]:
+        # Not every message with no spreadsheet attached is a question for the
+        # documents. "Tell me a joke" reaching the knowledge base and being told
+        # nothing is indexed about it is a switchboard answering a person.
+        spoken = converse(db, conversation, text,
+                          _state_note(db, conversation, None, True))
+        if spoken:
+            return _say(db, conversation, spoken,
+                        _suggest("Attach a spreadsheet", "What can you do?"))
+        return _say(db, conversation, result["answer"],
+                    _suggest("What can you do?", "Attach a spreadsheet"))
+
+    lines = [result["answer"]]
+    if not result.get("composed"):
+        for s_ in result["sources"][:3]:
+            lines.append(f"[{s_['n']}] {s_['title']}\n{s_['excerpt'][:300]}")
+    lines.append(
+        "This comes from indexed documents, not from a calculation. It can be "
+        "traced to the passage above; it cannot be re-computed the way a finding "
+        "from a spreadsheet can."
+    )
+
+    return _say(db, conversation, "\n\n".join(lines), kind="findings",
+                payload={"sources": result["sources"],
+                         **_suggest("Ask something else", "Attach a spreadsheet")})
 
 
 def _unresolved(db, conversation, report):

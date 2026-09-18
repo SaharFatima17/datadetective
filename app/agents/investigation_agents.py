@@ -526,6 +526,21 @@ def critique(db: Session, investigation: Investigation, findings: list[Finding])
         result = {"concerns": ["Automated critique unavailable."], "verdict": "proceed_with_caveats"}
 
     concerns = result.get("concerns", [])
+
+    # Drop objections the evidence already answers.
+    #
+    # A critic that repeats "seasonality has not been ruled out" in a report
+    # whose own findings state that it was ruled out contradicts the document it
+    # is attached to, and a reader has no way to tell which half to believe.
+    # The critique is meant to surface what the analysis missed, not to recite a
+    # checklist regardless of what was done.
+    evidence = " ".join((f.evidence_summary or "") for f in findings).lower()
+    season_checked = "calendar months a year earlier" in evidence
+    if season_checked:
+        concerns = [c for c in concerns
+                    if "seasonality" not in c.lower()
+                    or "not been ruled out" not in c.lower()]
+
     for f in findings:
         if f.confidence == "high" and "correlation" in (f.statement or "").lower():
             concerns.append(
