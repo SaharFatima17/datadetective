@@ -66,6 +66,7 @@ def index_document(
     source_id: uuid.UUID | None = None,
     metadata: dict | None = None,
     owner_id: uuid.UUID | None = None,
+    subject: str | None = None,
 ) -> Document:
     doc = Document(
         source_id=source_id,
@@ -74,7 +75,12 @@ def index_document(
         document_type=document_type,
         extracted_text=text[:1_000_000],
         status="pending",
-        document_metadata=metadata,
+        # The subject is stored alongside whatever the caller passed, so a
+        # document can be grouped at the moment it is indexed rather than
+        # needing a second step.
+        document_metadata={**(metadata or {}),
+                           **({"subject": subject.strip()[:120]}
+                              if (subject or "").strip() else {})} or None,
     )
     db.add(doc)
     db.flush()
@@ -111,6 +117,7 @@ def search(
     document_type: str | list[str] | None = None,
     min_score: float = 0.0,
     owner_id=None,
+    scope: str | None = None,
 ) -> list[dict]:
     """Semantic search with an optional structured filter (proposal Sec.14).
 
@@ -132,6 +139,9 @@ def search(
 
     scored = []
     skipped = 0
+    # A scope narrows retrieval to one body of knowledge. Applied here rather
+    # than by filtering results afterwards, so the top_k are the best matches
+    # within that body instead of whatever survived a global ranking.
     for chunk, doc in stmt.all():
         vector = (chunk.chunk_metadata or {}).get("vector")
         if not vector:
@@ -142,6 +152,8 @@ def search(
         # quietly ranked. `scripts/reindex_embeddings.py` brings them back.
         if len(vector) != len(q_vec):
             skipped += 1
+            continue
+        if scope and scope_key(doc) != scope:
             continue
         score = cosine_similarity(q_vec, vector)
         if score >= min_score:
@@ -157,6 +169,7 @@ def search(
                     # the page address, when the document came from the web —
                     # a citation the reader can actually open
                     "url": (doc.document_metadata or {}).get("url"),
+                    "scope": scope_key(doc),
                 }
             )
 
@@ -250,8 +263,112 @@ ANSWER_SYSTEM = (
 )
 
 
+def scope_key(doc) -> str:
+    """Which body of knowledge a document belongs to.
+
+    Grouping matters because a crawled site can hold a hundred passages while
+    an incident note holds one, and a similarity search over everything lets
+    the large body bury the small one — the small one often being the document
+    that actually answers the question.
+
+    The subject the person gave it wins. Grouping by where a document came from
+    was the first attempt and it breaks on the obvious case: a company's website
+    and that same company's pitch deck are one subject, but one was crawled and
+    the other uploaded, so they landed in different bodies and choosing either
+    lost half the material. Source is only the fallback when no subject is set.
+    """
+    meta = doc.document_metadata or {}
+    subject = (meta.get("subject") or "").strip()
+    if subject:
+        return f"subject:{subject.lower()}"
+
+    url = meta.get("url") or ""
+    if url.startswith("http"):
+        from urllib.parse import urlparse
+        host = urlparse(url).netloc.lower().removeprefix("www.")
+        return f"site:{host}"
+    if doc.document_type == "past_report":
+        return "reports"
+    return "uploads"
+
+
+def scope_label(key: str) -> str:
+    if key.startswith("subject:"):
+        return key[8:].title()
+    if key.startswith("site:"):
+        return key[5:]
+    return {"reports": "Past investigation reports",
+            "uploads": "Uploaded documents and definitions"}.get(key, key)
+
+
+def list_scopes(db: Session, owner_id=None) -> list[dict]:
+    """The bodies of knowledge available, so a question can be aimed at one."""
+    query = db.query(Document)
+    if owner_id is not None:
+        query = query.filter(Document.owner_id == owner_id)
+
+    grouped: dict[str, dict] = {}
+    for doc in query.all():
+        key = scope_key(doc)
+        entry = grouped.setdefault(
+            key, {"key": key, "label": scope_label(key), "documents": 0,
+                  "chunks": 0, "assigned": key.startswith("subject:")})
+        entry["documents"] += 1
+        entry["chunks"] += len(doc.chunks)
+    return sorted(grouped.values(), key=lambda g: -g["chunks"])
+
+
+def set_subject(db: Session, document_id, subject: str | None) -> dict:
+    """Move a document into a subject, or back to its source grouping.
+
+    Existing documents were indexed before subjects existed, so this is how
+    they get grouped without re-uploading them: the text and its vectors are
+    untouched, only the label that decides which body they belong to.
+    """
+    doc = db.get(Document, document_id)
+    if not doc:
+        raise ValueError("No such document")
+    meta = dict(doc.document_metadata or {})
+    cleaned = (subject or "").strip()
+    if cleaned:
+        meta["subject"] = cleaned[:120]
+    else:
+        meta.pop("subject", None)
+    doc.document_metadata = meta
+    db.flush()
+    for chunk in doc.chunks:
+        cm = dict(chunk.chunk_metadata or {})
+        cm["subject"] = meta.get("subject")
+        chunk.chunk_metadata = cm
+    db.commit()
+    return {"id": str(doc.id), "title": doc.title, "scope": scope_key(doc)}
+
+
+def model_status() -> str:
+    """Why a composed answer is missing: not set up, or set up and failing.
+
+    These are different situations and used to share one message — "no
+    language model is configured" — which was false whenever a model *was*
+    configured and a call had simply failed on quota or a dropped connection.
+    Telling someone their setup is missing when it is not sends them looking
+    for a problem that does not exist.
+    """
+    provider = (getattr(llm, "provider", "") or "").lower()
+    return "not_configured" if provider in {"", "mock"} else "unavailable"
+
+
+def fallback_notice() -> str:
+    if model_status() == "not_configured":
+        return ("No language model is configured, so this is the closest "
+                "matching passage rather than a written answer.")
+    return ("The language model is unavailable right now — often a usage "
+            "limit that resets daily — so this is the closest matching passage "
+            "rather than a written answer.")
+
+
 def answer_from_documents(db: Session, question: str, top_k: int = 6,
-                          owner_id=None) -> dict:
+                          owner_id=None, scope: str | None = None,
+                          on_compose=None) -> dict:
     """Answer a question from indexed documents, with citations (Sec.14).
 
     This is the document counterpart to an investigation, and it is deliberately
@@ -264,7 +381,8 @@ def answer_from_documents(db: Session, question: str, top_k: int = 6,
     honest degradation: quoting the source is a worse reading experience than a
     written answer, but it is never a fabricated one.
     """
-    hits = search(db, question, top_k=top_k, owner_id=owner_id, min_score=0.05)
+    hits = search(db, question, top_k=top_k, owner_id=owner_id,
+                  min_score=0.05, scope=scope)
     if not hits:
         return {
             "answered": False,
@@ -279,6 +397,9 @@ def answer_from_documents(db: Session, question: str, top_k: int = 6,
     )
 
     answer, grounded = None, True
+    if on_compose:
+        # the slow part starts here; say so while it runs
+        on_compose(len(hits))
     try:
         raw = llm.complete(system=ANSWER_SYSTEM,
                            prompt=f"Question: {question}\n\nPassages:\n{numbered}")
@@ -290,16 +411,27 @@ def answer_from_documents(db: Session, question: str, top_k: int = 6,
 
     if answer is None:
         grounded = False
-        answer = (
-            "No language model is configured, so here are the passages that "
-            "match most closely, in order. They are quoted as indexed, not "
-            "summarised."
-        )
+        answer = fallback_notice()
+
+    # When the passages come from unrelated bodies of knowledge, say so. A
+    # composed answer that draws on a café's incident note and a software
+    # company's product page reads as one coherent statement about one subject,
+    # and there is nothing in its wording to tell the reader it is not.
+    bodies = {h["scope"] for h in hits}
+    mixed = len(bodies) > 1 and scope is None
 
     return {
         "answered": True,
         "answer": answer,
         "composed": grounded,
+        "scopes_used": sorted(bodies),
+        "mixed_sources": mixed,
+        "mixed_note": (
+            "These passages come from more than one body of knowledge "
+            f"({', '.join(scope_label(b) for b in sorted(bodies))}). Check the "
+            "sources below before treating this as one subject, or ask the "
+            "question against a single source."
+        ) if mixed else None,
         "sources": [
             {"n": i + 1, "title": h["document_title"], "score": h["score"],
              "excerpt": h["content"][:400], "type": h["document_type"]}
@@ -323,7 +455,7 @@ BRIEF_SYSTEM = (
 
 
 def compose_brief(db: Session, topic: str, top_k: int = 14,
-                  owner_id=None) -> dict:
+                  owner_id=None, scope: str | None = None) -> dict:
     """Assemble a brief on a topic from indexed documents (proposal Sec.14).
 
     This is not an investigation report and must never be mistaken for one. An
@@ -336,7 +468,8 @@ def compose_brief(db: Session, topic: str, top_k: int = 14,
     by the page they came from. That is a worse read than composed prose and a
     truthful one: nothing is asserted that was not retrieved.
     """
-    hits = search(db, topic, top_k=top_k, owner_id=owner_id, min_score=0.05)
+    hits = search(db, topic, top_k=top_k, owner_id=owner_id,
+                  min_score=0.05, scope=scope)
     if not hits:
         return {"available": False,
                 "reason": "Nothing indexed covers that topic."}
@@ -365,7 +498,10 @@ def compose_brief(db: Session, topic: str, top_k: int = 14,
             by_source.setdefault(h["document_title"], []).append((i + 1, h["content"]))
         data = {
             "title": topic,
-            "summary": ("No language model is configured, so this is the "
+            "summary": (("No language model is configured"
+                         if model_status() == "not_configured" else
+                         "The language model is unavailable right now")
+                        + ", so this is the "
                         "retrieved material grouped by source rather than a "
                         "written brief. Nothing has been summarised or inferred."),
             "sections": [

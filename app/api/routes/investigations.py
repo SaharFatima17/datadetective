@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile
 from sqlalchemy.orm import Session
 
 from app.agents import orchestrator
@@ -29,7 +29,7 @@ from app.models import (
 from app.config import settings
 from app.models import Dataset, DatasetVersion
 from app.schemas.requests import FeedbackRequest, InvestigationCreate, ResumeRequest
-from app.services import ingestion
+from app.services import bundle, ingestion
 
 router = APIRouter(prefix="/api/investigations", tags=["investigations"])
 
@@ -245,6 +245,25 @@ def delete_investigation(investigation_id: uuid.UUID,
     db.commit()
     return {"deleted": True, "question": question,
             "indexed_reports_removed": removed_docs}
+
+
+@router.get("/{investigation_id}/bundle")
+def evidence_bundle(investigation_id: uuid.UUID,
+                    user: User = Depends(get_current_user),
+                    db: Session = Depends(get_db)):
+    """Download the whole evidence chain as one file.
+
+    Traceability shown on a screen requires this system to be running and the
+    person to be sitting at it. A bundle is the same chain in a form they can
+    take away and check on their own terms, which is the stronger claim.
+    """
+    investigation = _get(db, investigation_id, user)
+    payload, filename = bundle.build(db, investigation)
+    return Response(
+        content=payload,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.get("/{investigation_id}/comparison")

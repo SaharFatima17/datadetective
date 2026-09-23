@@ -86,9 +86,13 @@ class Embedder:
 
         attempts = max(1, settings.LLM_MAX_RETRIES)
         for attempt in range(attempts):
-            interval = settings.LLM_MIN_INTERVAL_MS / 1000
-            if interval and attempt == 0:
-                time.sleep(interval)
+            # No up-front sleep. This used to wait LLM_MIN_INTERVAL_MS before
+            # every request — six seconds with the free-tier setting — which
+            # is a budget meant for the chat model, not for embeddings, and
+            # was paid unconditionally. Planning an investigation embeds
+            # several terms in a row, so a single run slept for tens of
+            # seconds doing nothing. A rate limit, if it comes, is handled by
+            # the backoff below, which is where waiting belongs.
             r = httpx.post(url, json=payload, timeout=120)
             if r.status_code == 200:
                 return r

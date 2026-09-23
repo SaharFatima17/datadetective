@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import json
+import queue
+import threading
 import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.agents import chat as chat_agent
 from app.config import settings
 from app.core.deps import authorize_dataset, get_current_user, require_role
-from app.database import get_db
+from app.database import SessionLocal, get_db
 from app.models import Conversation, Dataset, DatasetVersion, Message, User
 from app.schemas.requests import ChatMessageRequest, ConversationCreate
 from app.services import ingestion, profiling, rag
@@ -153,6 +157,72 @@ def send_message(conversation_id: uuid.UUID, payload: ChatMessageRequest,
         raise HTTPException(500, f"The conversation failed: {exc}") from exc
 
     return {"messages": [_serialise(m) for m in replies]}
+
+
+def _sse(event: dict) -> str:
+    return f"data: {json.dumps(event, default=str)}\n\n"
+
+
+@router.post("/conversations/{conversation_id}/messages/stream")
+def send_message_stream(conversation_id: uuid.UUID, payload: ChatMessageRequest,
+                        user: User = Depends(require_role("admin", "analyst")),
+                        db: Session = Depends(get_db)):
+    """Send a message and stream what is happening until the reply is ready.
+
+    The plain endpoint returns nothing until the whole reply exists, which for a
+    question that runs an investigation can be a minute of a spinner with no
+    sign of life. People reasonably conclude it has hung. This sends each stage
+    as it actually begins — understanding the question, searching, writing — so
+    the wait is visible and truthful, then the finished messages at the end.
+
+    The work runs on its own database session in a worker thread: the request's
+    session belongs to the request and closes when the response starts
+    streaming, which is before the work is done.
+    """
+    conversation = _conversation(db, conversation_id, user)   # authorise first
+    text = payload.content.strip()
+    if not text:
+        raise HTTPException(422, "An empty message has nothing to answer")
+    conversation_key = conversation.id
+
+    events: queue.Queue = queue.Queue()
+
+    def work() -> None:
+        session = SessionLocal()
+        try:
+            thread_row = session.get(Conversation, conversation_key)
+            replies = chat_agent.respond(
+                session, thread_row, text,
+                progress=lambda stage: events.put({"type": "stage", "text": stage}))
+            session.commit()
+            events.put({"type": "done",
+                        "messages": [_serialise(m) for m in replies]})
+        except Exception as exc:  # noqa: BLE001
+            session.rollback()
+            events.put({"type": "error", "detail": f"The conversation failed: {exc}"})
+        finally:
+            session.close()
+            events.put(None)
+
+    threading.Thread(target=work, daemon=True).start()
+
+    def stream():
+        yield _sse({"type": "stage", "text": "Reading your message"})
+        while True:
+            try:
+                item = events.get(timeout=15)
+            except queue.Empty:
+                # a comment line: keeps proxies from closing a quiet connection
+                # while a long investigation is still running
+                yield ": still working\n\n"
+                continue
+            if item is None:
+                break
+            yield _sse(item)
+
+    return StreamingResponse(
+        stream(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @router.post("/conversations/{conversation_id}/upload")

@@ -30,10 +30,27 @@ def _lead(findings: list[dict]) -> dict | None:
     return findings[0] if findings else None
 
 
+def _completed(run: dict) -> bool:
+    """Did the run reach an answer at all?
+
+    An error string or an offline placeholder is not an answer. This is checked
+    before anything is scored, because the root-cause check works by searching
+    the answer text for the true driver's name — and an error message can
+    contain that name. A baseline whose reply was cut off mid-tool-call once
+    returned "[error: Could not parse JSON ... SELECT product, AVG(in_stock_rate)
+    ...]", which quoted the very column the scenario was about, and scored full
+    marks for root cause while having completed nothing. A failed run earns no
+    credit for a cause it never stated.
+    """
+    answer = run.get("answer") or ""
+    return bool(answer) and not answer.startswith("[error") \
+        and not answer.startswith("[mock")
+
+
 def score_run(truth: dict, run: dict) -> dict:
     findings = run.get("findings") or []
     answer = (run.get("answer") or "").lower()
-    haystack = _text_of(findings) + " " + answer
+    completed = _completed(run)
 
     driver_col = (truth.get("true_driver_column") or "").lower()
     driver_val = (truth.get("true_driver_value") or "")
@@ -48,18 +65,26 @@ def score_run(truth: dict, run: dict) -> dict:
         )
         asked = bool(run.get("asked_for_evidence")) or bool(
             run.get("unresolved_hypotheses"))
+        # Crashing is not the same as declining to guess. Only a run that
+        # finished can be credited with having asked instead of asserting.
+        correct = completed and asked and not asserted
         return {
             "criterion": "asks instead of asserting",
             "asked_for_evidence": asked,
             "asserted_unsupported_cause": asserted,
-            "root_cause_rank_1": asked and not asserted,
-            "root_cause_found": asked and not asserted,
-            **_shared(truth, run, findings),
+            "root_cause_rank_1": correct,
+            "root_cause_found": correct,
+            **_shared(truth, run, findings, completed),
         }
 
     # ---------------- normal root-cause scenarios ------------------------- #
+    # Only the run's own conclusions are searched. An incomplete run's text is
+    # an error message, not a conclusion, so it is excluded from both checks.
+    haystack = _text_of(findings) + (" " + answer if completed else "")
     lead = _lead(findings)
-    lead_text = ((lead or {}).get("statement") or answer).lower()
+    lead_text = ((lead or {}).get("statement")
+                 or (answer if completed else "")).lower()
+
     hit_lead = bool(driver_col and driver_col in lead_text) or bool(
         driver_val and driver_val in lead_text)
     hit_any = bool(driver_col and driver_col in haystack) or bool(
@@ -69,9 +94,9 @@ def score_run(truth: dict, run: dict) -> dict:
         "criterion": "true cause ranked first",
         "true_cause": truth["true_cause"],
         "lead_answer": (lead or {}).get("statement") or run.get("answer"),
-        "root_cause_rank_1": hit_lead,
-        "root_cause_found": hit_any,
-        **_shared(truth, run, findings),
+        "root_cause_rank_1": completed and hit_lead,
+        "root_cause_found": completed and hit_any,
+        **_shared(truth, run, findings, completed),
     }
 
 
@@ -139,8 +164,11 @@ def multi_source_credit(truth: dict, run: dict) -> dict:
     if not truth.get("requires_document"):
         return {}
     terms = [t.lower() for t in truth.get("document_evidence_terms", [])]
+    # an error message can quote a retrieved passage without the run having
+    # used it, so an incomplete run's answer is left out here too
+    answer = (run.get("answer") or "") if _completed(run) else ""
     haystack = (
-        _text_of(run.get("findings") or []) + " " + (run.get("answer") or "")
+        _text_of(run.get("findings") or []) + " " + answer
         + " " + " ".join(r.get("action", "") + " " + (r.get("rationale") or "")
                          for r in (run.get("recommendations") or []))
     ).lower()
@@ -166,8 +194,12 @@ def driver_change_credit(truth: dict, run: dict) -> dict:
     }
 
 
-def _shared(truth: dict, run: dict, findings: list[dict]) -> dict:
+def _shared(truth: dict, run: dict, findings: list[dict],
+            completed: bool | None = None) -> dict:
     """Metrics that apply to every scenario type."""
+    if completed is None:
+        completed = _completed(run)
+
     causal = [f for f in findings if f.get("finding_type") in {"driver", "association"}]
     verified = [f for f in findings if f.get("verification_status") == "verified"]
     traceable = [f for f in findings if f.get("tool_run_id")]
@@ -209,10 +241,7 @@ def _shared(truth: dict, run: dict, findings: list[dict]) -> dict:
         **forecast_accuracy(truth, run),
         **multi_source_credit(truth, run),
         **driver_change_credit(truth, run),
-        # An error string or a mock placeholder is not a completed task.
-        "completed": bool(run.get("answer"))
-        and not run["answer"].startswith("[error")
-        and not run["answer"].startswith("[mock"),
+        "completed": completed,
     }
 
 

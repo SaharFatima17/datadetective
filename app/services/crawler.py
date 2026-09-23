@@ -93,6 +93,7 @@ def crawl_site(
     owner_id: uuid.UUID | None = None,
     max_pages: int = MAX_PAGES,
     max_depth: int = MAX_DEPTH,
+    subject: str | None = None,
 ) -> dict:
     """Walk a site and index every page and document it finds.
 
@@ -187,6 +188,7 @@ def crawl_site(
             doc = rag.index_document(
                 db,
                 owner_id=owner_id,
+                subject=subject,
                 title=title,
                 text=text,
                 document_type="web_page",

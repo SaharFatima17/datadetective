@@ -11,6 +11,7 @@ from app.core.deps import authorize_dataset, get_current_user, require_role
 from app.database import get_db
 from app.models import Brief, Chart, Document, ToolRun, User
 from app.schemas.requests import (
+    SubjectUpdate,
     AnalyzeRequest,
     ChartRequest,
     DocumentIndexRequest,
@@ -108,7 +109,8 @@ def forecast(dataset_id: uuid.UUID, payload: ForecastRequest,
 def index_document(payload: DocumentIndexRequest,
                    user: User = Depends(require_role("admin", "analyst")),
                    db: Session = Depends(get_db)):
-    doc = rag.index_document(db, owner_id=user.id, title=payload.title, text=payload.text,
+    doc = rag.index_document(db, owner_id=user.id, subject=payload.subject,
+                             title=payload.title, text=payload.text,
                              document_type=payload.document_type, metadata=payload.metadata)
     db.commit()
     return {"document_id": str(doc.id), "title": doc.title,
@@ -125,7 +127,11 @@ def list_documents(user: User = Depends(get_current_user), db: Session = Depends
     rows = query.all()
     return {"count": len(rows), "documents": [
         {"id": str(d.id), "title": d.title, "type": d.document_type,
-         "status": d.status, "chunks": len(d.chunks), "created_at": d.created_at}
+         "status": d.status, "chunks": len(d.chunks),
+         # shown in the list so a document's grouping is visible without
+         # opening anything, and changeable from there
+         "subject": (d.document_metadata or {}).get("subject"),
+         "scope": rag.scope_key(d), "created_at": d.created_at}
         for d in rows
     ]}
 
@@ -170,6 +176,36 @@ def search(payload: SearchRequest, user: User = Depends(get_current_user),
                 owner_id=None if user.role == "admin" else user.id)}
 
 
+@router.patch("/documents/{document_id}/subject")
+def reassign_subject(document_id: uuid.UUID, payload: SubjectUpdate,
+                     user: User = Depends(require_role("admin", "analyst")),
+                     db: Session = Depends(get_db)):
+    """Group an already-indexed document under a subject.
+
+    Needed because grouping by source alone put a company's website and that
+    company's uploaded deck in different bodies of knowledge. Reassigning does
+    not re-embed anything — only the label that decides which body a document
+    belongs to changes.
+    """
+    doc = db.get(Document, document_id)
+    if not doc:
+        raise HTTPException(404, "No such document")
+    if doc.owner_id and doc.owner_id != user.id and user.role != "admin":
+        raise HTTPException(403, "That document belongs to another user")
+    try:
+        return rag.set_subject(db, document_id, payload.subject)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@router.get("/knowledge/scopes")
+def knowledge_scopes(user: User = Depends(get_current_user),
+                     db: Session = Depends(get_db)):
+    """The separate bodies of knowledge a question can be aimed at."""
+    return {"scopes": rag.list_scopes(
+        db, owner_id=None if user.role == "admin" else user.id)}
+
+
 @router.post("/ask")
 def ask_documents(payload: SearchRequest, user: User = Depends(get_current_user),
                   db: Session = Depends(get_db)):
@@ -181,7 +217,8 @@ def ask_documents(payload: SearchRequest, user: User = Depends(get_current_user)
     """
     return rag.answer_from_documents(
         db, payload.query, top_k=payload.top_k or 6,
-        owner_id=None if user.role == "admin" else user.id)
+        owner_id=None if user.role == "admin" else user.id,
+        scope=payload.scope)
 
 
 @router.post("/brief")
@@ -201,7 +238,8 @@ def brief(payload: SearchRequest,
     """
     result = rag.compose_brief(
         db, payload.query, top_k=payload.top_k or 14,
-        owner_id=None if user.role == "admin" else user.id)
+        owner_id=None if user.role == "admin" else user.id,
+        scope=payload.scope)
     if not result.get("available"):
         return result
 

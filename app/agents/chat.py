@@ -44,7 +44,7 @@ from app.models import (
 INTENTS = ("greeting", "farewell", "off_topic", "need_data", "investigate",
            "drill_down", "answer_request", "report", "explain", "about_system",
            "data_question", "capabilities", "acknowledge", "unresolved",
-           "document_question", "unclear")
+           "document_question", "list_documents", "unclear")
 
 GREETING = re.compile(
     r"^\s*(hi+|hello|hey|salam|assalam|assalamu|aoa|greetings"
@@ -72,7 +72,14 @@ REPORT_WORDS = ("report", "write up", "write-up", "summarise", "summarize",
 EXPLAIN_WORDS = ("explain", "simple words", "simply", "plain english", "what does that mean",
                  "what do you mean", "elaborate", "clarify", "are you sure",
                  "how do you know", "prove", "why do you say", "so what",
-                 "what does it mean", "in short")
+                 "what does it mean", "in short",
+                 # People do not always ask in English. Someone writing
+                 # "roman urdu mein smjha do" is asking for the same thing as
+                 # "explain that in simple words", and answering "I'm not sure
+                 # what you're asking for" to a perfectly clear request is the
+                 # system failing at its own job.
+                 "smjha", "samjha", "samjhao", "smjhao", "batao", "bta do",
+                 "bata do", "matlab kya", "kya matlab", "urdu", "roman")
 CAPABILITY_WORDS = ("what can you do", "how do you work", "who are you",
                     "what do you do", "help me")
 DRILL_WORDS = ("break", "split", " by ", " per ", "instead", "what about",
@@ -148,6 +155,17 @@ def classify(text: str, *, has_dataset: bool, awaiting: bool, has_report: bool,
         if has_report:
             return "explain"
         return "need_data" if not has_dataset else "unclear"
+    # Checked before the report words, which include "document".
+    # "Which documents do you have" — including when no model is available,
+    # which is exactly when this reached the rules and was told to attach a
+    # spreadsheet instead.
+    if (any(w in lowered for w in ("document", "documents", "sources", "files",
+                                   "pages", "websites", "sites"))
+            and any(w in lowered for w in ("kon", "kaun", "which", "what",
+                                           "list", "kya", "konse", "kaunse",
+                                           "available", "have"))
+            and has_documents):
+        return "list_documents"
     if any(w in lowered for w in REPORT_WORDS):
         if has_report:
             return "report"
@@ -171,26 +189,67 @@ def classify(text: str, *, has_dataset: bool, awaiting: bool, has_report: bool,
     return "unclear"
 
 
-def refine_with_model(text: str, rule_intent: str, context: dict) -> str:
-    """Let a configured model correct the rules; ignore it when it is mock.
+def refine_with_model(text: str, rule_intent: str, context: dict,
+                      transcript: str = "") -> str:
+    """Decide what the person is asking for, using a model when one is set.
 
-    The rules decide the path, so behaviour is identical with or without a key.
-    A real model only helps with phrasings the keywords miss.
+    The keyword rules used to decide this, with the model allowed only to
+    correct them. That kept behaviour identical with and without a key, which
+    was the point — and it was the wrong trade. A keyword list only recognises
+    the phrasings someone thought of in advance: "smjha do" means exactly what
+    "explain that" means, and the rules answered it with "I'm not sure what
+    you're asking for". A person asking a clear question does not care which
+    words the list contains.
+
+    So the model decides when one is configured, and the rules become the
+    fallback for when none is. What the model may decide is fixed: it picks one
+    of a closed set of actions. It never performs the action, and it never
+    produces a figure — `investigate` still runs the tools, `explain` still
+    rewords a stored finding. Routing is a judgement; arithmetic is not.
     """
     try:
         result = llm.complete_json(
-            system=("Classify one message from a data-analysis conversation. "
-                    'Reply with JSON {"intent": "..."} and nothing else. '
-                    "Allowed: " + ", ".join(INTENTS) + ". "
-                    "investigate = a NEW analytical question about the data. "
-                    "drill_down = re-cut the existing answer by another column. "
-                    "explain = asking about the answer already given. "
-                    "about_system = asking what a term means. "
-                    "data_question = asking about the dataset itself, not a cause."),
-            prompt=(f"Message: {text}\n"
+            system=(
+                "Decide what one message in a data-analysis conversation is "
+                'asking for. Reply with JSON {"intent": "..."} and nothing '
+                "else. Allowed values: " + ", ".join(INTENTS) + ".\n\n"
+                "greeting       hello, salam, good morning\n"
+                "farewell       bye, khuda hafiz, that is all\n"
+                "acknowledge    thanks, ok, got it\n"
+                "capabilities   what can you do, how does this work\n"
+                "about_system   what a term means: driver, health score, "
+                "verified, forecast, contribution\n"
+                "investigate    a NEW analytical question about their data\n"
+                "drill_down     re-cut the existing answer by a different "
+                "column\n"
+                "explain        asking about the answer already given: explain "
+                "it, say it simply, one line, another language, are you sure, "
+                "how do you know\n"
+                "unresolved     what could you not establish, what was missed\n"
+                "data_question  about the dataset itself: how many rows, what "
+                "columns, what quality issues\n"
+                "report         write it up, produce the report\n"
+                "document_question  answerable from indexed documents or "
+                "websites rather than a spreadsheet\n"
+                "need_data      wants analysis but no data is attached\n"
+                "off_topic      jokes, recipes, coding help, world knowledge, "
+                "opinions\n"
+                "unclear        genuinely cannot tell\n\n"
+                "The message may be in any language, including Roman Urdu. "
+                "Judge the intent, not the vocabulary.\n\n"
+                "WHEN AN ANSWER ALREADY EXISTS, PREFER explain. A request for "
+                "that same answer in a different form — shorter, one line, "
+                "simpler, in another language, 'just tell me where' — is "
+                "explain. Running the analysis again produces a second "
+                "identical report and wastes the person's time. Choose "
+                "investigate only when the message asks about a metric, a "
+                "period or a question the existing answer does not cover."
+            ),
+            prompt=(f"Conversation so far:\n{transcript or '(nothing yet)'}\n\n"
+                    f"Latest message: {text}\n\n"
                     f"Data attached: {context['has_dataset']}\n"
                     f"Answer already given: {context['has_report']}\n"
-                    f"Rule-based guess: {rule_intent}"),
+                    f"Documents indexed: {context.get('has_documents')}"),
         )
         intent = (result or {}).get("intent") if isinstance(result, dict) else None
         if intent in INTENTS:
@@ -311,6 +370,16 @@ def _fallback_title(text: str) -> str:
 
 
 def title_for(text: str) -> str:
+    """Name a thread from its first real question — without a model call.
+
+    Asking the model for a title cost a full round trip on the first message of
+    every thread, in front of the reply the person was actually waiting for.
+    Titles drawn from the question itself are nearly as good and instant.
+    """
+    return _fallback_title(text)
+
+
+def _title_from_model(text: str) -> str:
     """Name a thread from its first real message (proposal Sec.17)."""
     try:
         raw = llm.complete(system=TITLE_SYSTEM, prompt=text.strip()[:400])
@@ -377,7 +446,31 @@ def add_message(db: Session, conversation: Conversation, role: str, content: str
 
 
 # ------------------------------------------------------------------ turn #
-def respond(db: Session, conversation: Conversation, text: str) -> list[Message]:
+# What the person sees while a reply is being prepared. Each line is emitted
+# at the moment that step actually begins, not on a timer — a progress message
+# that runs ahead of the work it describes is its own small untruth.
+STAGE_FOR_INTENT = {
+    "investigate": "Running the investigation — testing hypotheses against your data",
+    "drill_down": "Re-cutting the answer by another column",
+    "explain": "Rewording the answer",
+    "report": "Preparing the report",
+    "unresolved": "Collecting what could not be established",
+    "data_question": "Reading the dataset profile",
+    "document_question": "Searching the knowledge base",
+    "list_documents": "Listing what is indexed",
+    "about_system": "Looking up the definition",
+    "answer_request": "Picking the investigation back up",
+}
+
+
+def _noop(_stage: str) -> None:
+    return None
+
+
+def respond(db: Session, conversation: Conversation, text: str,
+            progress=None) -> list[Message]:
+    """Handle one message. `progress`, if given, is called with each stage."""
+    progress = progress or _noop
     """Handle one user message and return the assistant's reply messages."""
     add_message(db, conversation, "user", text)
     maybe_name(db, conversation, text)
@@ -398,10 +491,37 @@ def respond(db: Session, conversation: Conversation, text: str) -> list[Message]
 
     context = {"has_dataset": conversation.dataset_id is not None,
                "has_report": report is not None}
-    intent = classify(text, awaiting=pending is not None, columns=columns,
-                      has_documents=has_documents, **context)
-    if not pending:
-        intent = refine_with_model(text, intent, context)
+
+    # An open request for data outranks everything: the thread already asked a
+    # question and this reply belongs to it, whatever it looks like.
+    if pending:
+        intent = "answer_request"
+    else:
+        rule_guess = classify(text, awaiting=False, columns=columns,
+                              has_documents=has_documents, **context)
+
+        # Some messages leave nothing to decide. The rules only return these
+        # for short, unambiguous phrasings — "salam", "thanks", "bye", "which
+        # documents do you have" — and the model would reach the same answer
+        # after a round trip of several seconds. Everything else still goes to
+        # the model, so an unusual phrasing is still understood.
+        if rule_guess in {"greeting", "farewell", "acknowledge", "list_documents"}:
+            intent = rule_guess
+        else:
+            progress("Understanding your question")
+            intent = refine_with_model(
+                text, rule_guess, {**context, "has_documents": has_documents},
+                _recent_transcript(db, conversation))
+
+        # A model can ask for something the state does not support. Routing to
+        # an answer that cannot exist is worse than routing to the runner-up.
+        if intent in {"explain", "report", "drill_down", "unresolved"} and not report:
+            intent = "investigate" if conversation.dataset_id else (
+                "document_question" if has_documents else "need_data")
+        if intent in {"investigate", "drill_down", "data_question"} and not conversation.dataset_id:
+            intent = "document_question" if has_documents else "need_data"
+
+    progress(STAGE_FOR_INTENT.get(intent, "Writing a reply"))
 
     # Greetings, thanks, capability questions and anything unclassified are
     # conversation rather than analysis. A model answers those in the person's
@@ -440,12 +560,14 @@ def respond(db: Session, conversation: Conversation, text: str) -> list[Message]
         return _resume(db, conversation, investigation, pending, text)
     if intent == "report":
         return _deliver_report(db, conversation, report)
+    if intent == "list_documents":
+        return [_list_documents(db, conversation)]
     if intent == "document_question":
-        return [_answer_from_documents(db, conversation, text)]
+        return [_answer_from_documents(db, conversation, text, progress)]
     if intent == "unresolved":
         return [_unresolved(db, conversation, report)]
     if intent == "explain":
-        return [_explain(db, conversation, investigation)]
+        return [_explain(db, conversation, investigation, text)]
     if intent == "data_question":
         return [_describe_data(db, conversation, profile)]
     if intent == "drill_down":
@@ -523,6 +645,16 @@ no finding. You have not seen their data and you cannot calculate. If they ask
 something answerable from their data, say you will look and let the analysis
 run. Inventing a number here would destroy the only thing this system is for.
 
+ANSWER IN THE LANGUAGE THEY USE. If someone writes in Roman Urdu, reply in
+Roman Urdu; if they ask for a particular language, use it. Figures and column
+names stay exactly as written — those are data, not prose, and rewording them
+would change what they say.
+
+DESCRIBE ONLY WHAT EXISTS. When explaining how to use this system, say only
+what is true: a question can be limited to one subject by choosing it in the
+knowledge base, or by naming the subject in the question. Do not invent other
+features, commands or behaviour. If you are not sure something exists, say so.
+
 STAY ON YOUR SUBJECT. You are not a general assistant. Greetings, thanks and
 goodbyes get a natural reply. Everything else must concern data investigation,
 this system, or the documents that have been indexed.
@@ -533,6 +665,22 @@ is not what you do, and offer what you can: investigate a question about their
 data, explain a finding, or answer from the indexed documents. Do not apologise
 at length and do not comply partially — a joke told "just this once" teaches the
 person to expect a general chatbot, and then to trust its numbers too."""
+
+
+def _recent_transcript(db: Session, conversation: Conversation, limit: int = 6) -> str:
+    """The last few turns, so a follow-up is read in context.
+
+    "And by product?" means nothing on its own; after a regional breakdown it
+    means re-cut that answer. Intent without context is guesswork.
+    """
+    history = (
+        db.query(Message)
+        .filter(Message.conversation_id == conversation.id)
+        .order_by(Message.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return "\n".join(f"{m.role}: {m.content[:220]}" for m in reversed(history))
 
 
 def converse(db: Session, conversation: Conversation, text: str,
@@ -672,7 +820,8 @@ def _describe_data(db: Session, conversation: Conversation, profile: dict):
                 _suggest("Why did revenue decline?", "What is a health score?"))
 
 
-def _explain(db: Session, conversation: Conversation, investigation):
+def _explain(db: Session, conversation: Conversation, investigation,
+             text: str = ""):
     """Reword the answer already established. Nothing is recomputed."""
     driver = _driver_finding(db, investigation.id) if investigation else None
     if not driver:
@@ -684,6 +833,22 @@ def _explain(db: Session, conversation: Conversation, investigation):
             _suggest("What's in this data?", "Ask a different question"))
 
     unit = driver.unit or "the metric"
+
+    # Reword the established finding rather than recite a fixed sentence. The
+    # numbers are passed in and must come back unchanged — the model is
+    # rephrasing a result, not producing one — but the phrasing and the
+    # language follow whatever the person asked for.
+    spoken = converse(
+        db, conversation, text,
+        "An investigation has finished. Restate this finding for them, keeping "
+        "every figure exactly as written and inventing nothing: "
+        f'"{driver.statement}" Supporting detail: {driver.evidence_summary} '
+        f'What it does not say: {driver.caveats or "nothing further"}.')
+    if spoken:
+        return _say(db, conversation, spoken,
+                    _suggest("Show me the calculation", "Write the report",
+                             "Break it down by another column"))
+
     content = (
         f"In plain terms: {driver.statement}\n\n"
         f"What that means is the movement in {unit} is not spread evenly. It is "
@@ -751,15 +916,56 @@ def _drill(db: Session, conversation: Conversation, text: str,
                                     "Explain that in simple words")})
 
 
-def _answer_from_documents(db: Session, conversation: Conversation, text: str):
+def _list_documents(db: Session, conversation: Conversation):
+    """What is in the knowledge base, grouped the way questions are scoped.
+
+    Asked "which documents do you have", the chat used to reply "attach a
+    spreadsheet" — true that none was attached, and no help at all, since the
+    person was asking about documents already there.
+    """
+    scopes = rag.list_scopes(db, owner_id=conversation.owner_id)
+    if not scopes:
+        return _say(db, conversation,
+                    "Nothing is indexed yet. Add a document or a website from "
+                    "the knowledge base or Sources, and I can answer from it.",
+                    _suggest("What can you do?"))
+
+    lines = [f"{len(scopes)} bod{'ies' if len(scopes) != 1 else 'y'} of "
+             "knowledge indexed:"]
+    for s_ in scopes:
+        lines.append(f"\u2022 {s_['label']} \u2014 {s_['documents']} "
+                     f"document{'s' if s_['documents'] != 1 else ''}, "
+                     f"{s_['chunks']} passages")
+    lines.append("Ask about any of them, or choose one in the knowledge base "
+                 "to keep the answer to a single subject.")
+    return _say(db, conversation, "\n".join(lines),
+                _suggest(*[f"What is in {x['label']}?" for x in scopes[:2]]))
+
+
+def _answer_from_documents(db: Session, conversation: Conversation, text: str,
+                           progress=_noop):
     """Answer from the knowledge base when there is no dataset in play.
 
     The sources are listed with the answer, always. A document answer cannot be
     re-computed the way a finding can, so the only thing that makes it checkable
     is showing where each part came from.
     """
+    # Naming a subject in the question narrows the search to it — "Zylo ka CEO
+    # kaun hai" searches only what is filed under Zylo. The assistant once told
+    # someone this worked when it did not; rather than forbid the sentence, the
+    # behaviour it described now exists.
+    scope = None
+    lowered = text.lower()
+    for body in rag.list_scopes(db, owner_id=conversation.owner_id):
+        label = body["label"].lower()
+        if body.get("assigned") and len(label) >= 3 and label in lowered:
+            scope = body["key"]
+            progress(f"Searching only {body['label']} — {body['chunks']} passages")
+            break
+
     result = rag.answer_from_documents(
-        db, text, top_k=5, owner_id=conversation.owner_id)
+        db, text, top_k=5, owner_id=conversation.owner_id, scope=scope,
+        on_compose=lambda n: progress(f"Writing the answer from {n} passages"))
 
     if not result["answered"]:
         # Not every message with no spreadsheet attached is a question for the
@@ -775,13 +981,29 @@ def _answer_from_documents(db: Session, conversation: Conversation, text: str):
 
     lines = [result["answer"]]
     if not result.get("composed"):
-        for s_ in result["sources"][:3]:
-            lines.append(f"[{s_['n']}] {s_['title']}\n{s_['excerpt'][:300]}")
-    lines.append(
-        "This comes from indexed documents, not from a calculation. It can be "
-        "traced to the passage above; it cannot be re-computed the way a finding "
-        "from a spreadsheet can."
-    )
+        # One passage, trimmed at a sentence. Three raw passages quoted in full
+        # filled the screen with text the person had not asked for, and a wall
+        # of excerpts is harder to read than no answer. The rest are one click
+        # away in the knowledge base, which is built for reading them.
+        top = result["sources"][0] if result["sources"] else None
+        if top:
+            excerpt = top["excerpt"].strip()
+            cut = excerpt[:260]
+            stop = max(cut.rfind(". "), cut.rfind("? "), cut.rfind("! "))
+            if stop > 120:
+                cut = cut[:stop + 1]
+            lines.append(f"From \u201c{top['title']}\u201d: {cut}"
+                         + ("" if cut.endswith((".", "?", "!")) else "\u2026"))
+        more = len(result["sources"]) - 1
+        if more > 0:
+            lines.append(f"{more} more matching passage{'s' if more != 1 else ''} "
+                         "are in the knowledge base.")
+    else:
+        lines.append(
+            "This comes from indexed documents, not from a calculation. It can "
+            "be traced to the passages it cites; it cannot be re-computed the "
+            "way a finding from a spreadsheet can."
+        )
 
     return _say(db, conversation, "\n\n".join(lines), kind="findings",
                 payload={"sources": result["sources"],

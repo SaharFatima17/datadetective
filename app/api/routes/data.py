@@ -5,7 +5,7 @@ from pathlib import Path
 
 import shutil
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -43,6 +43,9 @@ def _version(db: Session, ds: Dataset, version_id: str | None) -> DatasetVersion
 # ===================== Phase 2: ingestion ============================ #
 @router.post("/sources/upload")
 async def upload_source(file: UploadFile = File(...),
+                        # Optional: what this document is about, so an uploaded
+                        # deck can join the crawled site for the same company.
+                        subject: str | None = Form(None),
                         user: User = Depends(require_role("admin", "analyst")),
                         db: Session = Depends(get_db)):
     """Upload a file. Tabular files become datasets; documents are indexed for RAG."""
@@ -67,7 +70,8 @@ async def upload_source(file: UploadFile = File(...),
         elif ext in ingestion.DOCUMENT_EXTS:
             artifact = next(a for a in source.artifacts if a.artifact_type == "original")
             text = ingestion.extract_text(Path(artifact.storage_path))
-            doc = rag.index_document(db, owner_id=user.id, title=file.filename, text=text,
+            doc = rag.index_document(db, owner_id=user.id, subject=subject,
+                                     title=file.filename, text=text,
                                      document_type="business_doc", source_id=source.id)
             source.status = "extracted"
             response.update(kind="document", document_id=str(doc.id),
@@ -116,7 +120,8 @@ def crawl(payload: CrawlRequest,
     try:
         return crawler.crawl_site(db, payload.url, owner_id=user.id,
                                   max_pages=payload.max_pages,
-                                  max_depth=payload.max_depth)
+                                  max_depth=payload.max_depth,
+                                  subject=payload.subject)
     except ValueError as exc:
         db.rollback()
         raise HTTPException(400, str(exc)) from exc
@@ -132,7 +137,8 @@ def ingest_url(payload: URLIngestRequest,
         if payload.index_for_rag:
             artifact = source.artifacts[0]
             text = ingestion.extract_text(Path(artifact.storage_path))
-            doc = rag.index_document(db, owner_id=user.id, title=payload.url, text=text,
+            doc = rag.index_document(db, owner_id=user.id, subject=payload.subject,
+                                     title=payload.url, text=text,
                                      document_type="web_page", source_id=source.id)
             source.status = "extracted"
             result.update(document_id=str(doc.id), chunks=len(doc.chunks))

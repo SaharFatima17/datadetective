@@ -28,6 +28,7 @@ class SQLIngestRequest(BaseModel):
 
 
 class URLIngestRequest(BaseModel):
+    subject: str | None = None
     url: str
     index_for_rag: bool = True
 
@@ -85,7 +86,15 @@ class DocumentIndexRequest(BaseModel):
     metadata: dict[str, Any] | None = None
 
 
+class SubjectUpdate(BaseModel):
+    # Empty or null returns the document to grouping by where it came from.
+    subject: str | None = None
+
+
 class SearchRequest(BaseModel):
+    # Limits retrieval to one body of knowledge — a crawled site, the uploads,
+    # or past reports. Without it a large crawl can bury a one-page note.
+    scope: str | None = None
     query: str
     top_k: int = 5
     document_type: str | None = None
@@ -115,6 +124,7 @@ class ConversationCreate(BaseModel):
 
 class CrawlRequest(BaseModel):
     url: str
+    subject: str | None = None
     # Kept small on purpose: a crawl nobody can review is a crawl nobody trusts.
     max_pages: int = 15
     max_depth: int = 2
